@@ -184,7 +184,11 @@ fun CreateCharacterScreen(
                         id = character?.id ?: System.currentTimeMillis(),
                         name = name,
                         race = selectedRace,
-                        profession = selectedProfession
+                        profession = selectedProfession,
+                        level = character?.level ?: 1,
+                        experience = character?.experience ?: 0,
+                        experienceRequired = character?.experienceRequired ?: experienceForLevel(1),
+                        autoExperience = character?.autoExperience ?: true
                     )
 
                     onCreate(updatedCharacter)

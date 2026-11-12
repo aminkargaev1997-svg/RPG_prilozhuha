@@ -30,6 +30,10 @@ object CharacterStorage {
                 put("name", character.name)
                 put("race", character.race)
                 put("profession", character.profession)
+                put("level", character.level)
+                put("experience", character.experience)
+                put("experienceRequired", character.experienceRequired)
+                put("autoExperience", character.autoExperience)
             })
         }
         preferences(context).edit()
@@ -47,7 +51,12 @@ object CharacterStorage {
                     id = item.getLong("id"),
                     name = item.getString("name"),
                     race = item.getString("race"),
-                    profession = item.getString("profession")
+                    profession = item.getString("profession"),
+                    level = item.optInt("level", 1).coerceAtLeast(1),
+                    experience = item.optInt("experience", 0).coerceAtLeast(0),
+                    experienceRequired = item.optInt("experienceRequired", 250).coerceAtLeast(1),
+                    // Legacy characters had a freely configured fixed threshold.
+                    autoExperience = item.optBoolean("autoExperience", false)
                 )
             }
         } catch (_: Exception) {
@@ -63,6 +72,7 @@ object CharacterStorage {
                 put("id", item.id)
                 put("name", item.name)
                 put("quantity", item.quantity)
+                put("description", item.description)
             })
         }
         preferences(context).edit()
@@ -80,7 +90,8 @@ object CharacterStorage {
                 InventoryItem(
                     id = item.getLong("id"),
                     name = item.getString("name"),
-                    quantity = item.optString("quantity", "")
+                    quantity = item.optString("quantity", ""),
+                    description = item.optString("description", "")
                 )
             }
         } catch (_: Exception) {

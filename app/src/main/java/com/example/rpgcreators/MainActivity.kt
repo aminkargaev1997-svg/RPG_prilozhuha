@@ -73,6 +73,7 @@ fun AppScreen(modifier: Modifier = Modifier) {
 
     // Состояние навигации переживает пересоздание Activity при повороте экрана.
     var currentScreen by rememberSaveable { mutableStateOf("home") }
+    var appRole by rememberSaveable { mutableStateOf("player") }
     var selectedCharacterId by rememberSaveable { mutableStateOf<Long?>(null) }
     var showDeleteDialog by rememberSaveable { mutableStateOf(false) }
 
@@ -93,10 +94,34 @@ fun AppScreen(modifier: Modifier = Modifier) {
 
     when (currentScreen) {
 
-        "home" -> MainScreen(
+        "home" -> RoleSelectionScreen(
+            onPlayer = { appRole = "player"; currentScreen = "playerMenu" },
+            onMaster = { appRole = "master"; currentScreen = "masterMenu" }
+        )
+        "playerMenu" -> MainScreen(
             modifier,
             { currentScreen = "create" },
-            { currentScreen = "list" }
+            { currentScreen = "list" },
+            { currentScreen = "lan" },
+            onBack = { currentScreen = "home" }
+        )
+        "masterMenu" -> MasterMenuScreen(
+            onNetwork = { currentScreen = "lan" },
+            onBack = { currentScreen = "home" }
+        )
+
+        "lan" -> LanGameScreen(
+            modifier = modifier,
+            characters = characters.toList(),
+            onBack = { currentScreen = if (appRole == "master") "masterMenu" else "playerMenu" },
+            isMaster = appRole == "master",
+            onCharacterUpdate = { updated ->
+                val index = characters.indexOfFirst { it.id == updated.id }
+                if (index >= 0) {
+                    characters[index] = updated
+                    CharacterStorage.saveCharacters(context, characters.toList())
+                }
+            }
         )
 
         "create" -> CreateCharacterScreen(
@@ -123,7 +148,14 @@ fun AppScreen(modifier: Modifier = Modifier) {
                 onBack = { currentScreen = "list" },
                 onPlay = { currentScreen = "game" },
                 onEdit = { currentScreen = "edit" },
-                onDelete = { showDeleteDialog = true }
+                onDelete = { showDeleteDialog = true },
+                onUpdateCharacter = { updated ->
+                    val index = characters.indexOfFirst { it.id == updated.id }
+                    if (index >= 0) {
+                        characters[index] = updated
+                        CharacterStorage.saveCharacters(context, characters.toList())
+                    }
+                }
             )
         }
 
@@ -236,11 +268,40 @@ fun AppScreen(modifier: Modifier = Modifier) {
     }
 }
 
+
+@Composable
+fun RoleSelectionScreen(onPlayer: () -> Unit, onMaster: () -> Unit) {
+    Column(Modifier.fillMaxSize().padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center) {
+        Text("RPG Creators", fontSize = 32.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(28.dp))
+        Button(onClick = onPlayer, modifier = Modifier.fillMaxWidth()) { Text("⚔ Игрок") }
+        Spacer(Modifier.height(14.dp))
+        OutlinedButton(onClick = onMaster, modifier = Modifier.fillMaxWidth()) { Text("♛ Мастер") }
+    }
+}
+
+@Composable
+fun MasterMenuScreen(onNetwork: () -> Unit, onBack: () -> Unit) {
+    Column(Modifier.fillMaxSize().padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center) {
+        Text("Режим мастера", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(24.dp))
+        Button(onClick = onNetwork, modifier = Modifier.fillMaxWidth()) { Text("Создать сетевую комнату") }
+        Spacer(Modifier.height(12.dp))
+        TextButton(onClick = onBack) { Text("← Выбор роли") }
+    }
+}
+
 @Composable
 fun MainScreen(
     modifier: Modifier = Modifier,
     onCreateCharacter: () -> Unit,
-    onShowCharacters: () -> Unit
+    onShowCharacters: () -> Unit,
+    onNetwork: () -> Unit,
+    onBack: () -> Unit = {}
 ) {
     Column(
         modifier = modifier
@@ -257,6 +318,8 @@ fun MainScreen(
         )
 
         Spacer(Modifier.height(12.dp))
+
+        TextButton(onClick = onBack) { Text("← Выбор роли") }
 
         Text("Создай своего персонажа")
 
@@ -276,6 +339,15 @@ fun MainScreen(
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Мои персонажи")
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        Button(
+            onClick = onNetwork,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Сетевая игра (LAN)")
         }
 
     }
@@ -339,11 +411,89 @@ fun CharacterDetailsScreen(
     onBack: () -> Unit,
     onPlay: () -> Unit,
     onEdit: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onUpdateCharacter: (Character) -> Unit
 ) {
+    var showExperienceDialog by remember(character.id) { mutableStateOf(false) }
+    var showMaximumDialog by remember(character.id) { mutableStateOf(false) }
+    var experienceInput by remember { mutableStateOf("") }
+    var maximumInput by remember { mutableStateOf("") }
+
+    if (showExperienceDialog) {
+        AlertDialog(
+            onDismissRequest = { showExperienceDialog = false },
+            title = { Text("Добавить опыт") },
+            text = {
+                OutlinedTextField(
+                    value = experienceInput,
+                    onValueChange = { experienceInput = it.filter(Char::isDigit).take(9) },
+                    label = { Text("Количество опыта") },
+                    singleLine = true,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = (experienceInput.toIntOrNull() ?: 0) > 0,
+                    onClick = {
+                        val amount = experienceInput.toIntOrNull() ?: 0
+                        onUpdateCharacter(character.addExperience(amount))
+                        experienceInput = ""
+                        showExperienceDialog = false
+                    }
+                ) { Text("Добавить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showExperienceDialog = false }) { Text("Отмена") }
+            }
+        )
+    }
+
+    if (showMaximumDialog) {
+        AlertDialog(
+            onDismissRequest = { showMaximumDialog = false },
+            title = { Text("Максимум опыта до уровня") },
+            text = {
+                OutlinedTextField(
+                    value = maximumInput,
+                    onValueChange = { maximumInput = it.filter(Char::isDigit).take(9) },
+                    label = { Text("Новый максимум") },
+                    singleLine = true,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = (maximumInput.toIntOrNull() ?: 0) > 0,
+                    onClick = {
+                        val max = maximumInput.toIntOrNull() ?: character.experienceRequired
+                        val total = character.experience
+                        val extraLevels = total / max
+                        val updated = character.copy(
+                            level = (character.level.toLong() + extraLevels).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                            experience = total % max,
+                            experienceRequired = max,
+                            autoExperience = false
+                        )
+                        onUpdateCharacter(updated)
+                        showMaximumDialog = false
+                    }
+                ) { Text("Сохранить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showMaximumDialog = false }) { Text("Отмена") }
+            }
+        )
+    }
+
     Column(
         Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
@@ -355,6 +505,33 @@ fun CharacterDetailsScreen(
 
         Text("Раса: ${character.race}", fontSize = 18.sp)
         Text("Профессия: ${character.profession}", fontSize = 18.sp)
+
+        Text("Уровень ${character.level}", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Text("${character.experience}/${character.experienceRequired} опыта", fontSize = 18.sp)
+        LinearProgressIndicator(
+            progress = { character.experience.toFloat() / character.experienceRequired.coerceAtLeast(1) },
+            modifier = Modifier.fillMaxWidth()
+        )
+        Button(
+            onClick = { experienceInput = ""; showExperienceDialog = true },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Добавить опыт") }
+        OutlinedButton(
+            onClick = { maximumInput = character.experienceRequired.toString(); showMaximumDialog = true },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Изменить максимум опыта") }
+        Text(if (character.autoExperience) "Опыт рассчитывается автоматически: 650 + 750 × (уровень − 1)"
+             else "Установлен ручной максимум опыта", fontSize = 12.sp)
+        if (!character.autoExperience) {
+            TextButton(onClick = {
+                val max = experienceForLevel(character.level)
+                onUpdateCharacter(character.copy(
+                    experienceRequired = max,
+                    experience = character.experience.coerceAtMost(max - 1),
+                    autoExperience = true
+                ))
+            }) { Text("Включить автоматический максимум") }
+        }
 
         Spacer(Modifier.height(8.dp))
 
@@ -392,6 +569,7 @@ data class InventoryItem(
     val id: Long = System.nanoTime(),
     val name: String,
     val quantity: String = "",
+    val description: String = "",
     val position: Offset = Offset.Zero
 )
 
@@ -448,7 +626,9 @@ fun GameScreen(
     character: Character,
     onBack: () -> Unit,
     onAbilities: () -> Unit,
-    onMaps: () -> Unit
+    onMaps: () -> Unit,
+    showNavigation: Boolean = true,
+    onEvent: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -498,6 +678,9 @@ fun GameScreen(
     var deleteMode by remember { mutableStateOf(false) }
 
     var itemName by remember { mutableStateOf("") }
+    var itemDescription by remember { mutableStateOf("") }
+    var selectedInventoryItem by remember { mutableStateOf<InventoryItem?>(null) }
+    var showInventoryDetails by remember { mutableStateOf(false) }
     var hasQuantity by remember { mutableStateOf(false) }
     var itemQuantity by remember { mutableStateOf("") }
 
@@ -547,7 +730,7 @@ fun GameScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
-        Row(
+        if (showNavigation) Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -789,6 +972,12 @@ fun GameScreen(
                                     )
                                 }
                             }
+                        }
+                        .pointerInput(item.id, deleteMode) {
+                            if (!deleteMode) detectTapGestures {
+                                selectedInventoryItem = item
+                                showInventoryDetails = false
+                            }
                         },
                     contentAlignment = Alignment.Center
                 ) {
@@ -835,6 +1024,7 @@ fun GameScreen(
                 onClick = {
                     deleteMode = false
                     itemName = ""
+                    itemDescription = ""
                     itemQuantity = ""
                     hasQuantity = false
                     showAddDialog = true
@@ -862,6 +1052,31 @@ fun GameScreen(
         }
     }
 
+    selectedInventoryItem?.let { item ->
+        AlertDialog(
+            onDismissRequest = { selectedInventoryItem = null },
+            title = { Text(item.name) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (item.quantity.isNotBlank()) Text("Количество: ${item.quantity}")
+                    if (showInventoryDetails) {
+                        Text(item.description.ifBlank { "Описание не добавлено." })
+                    } else {
+                        Text("Информация о предмете скрыта.")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showInventoryDetails = !showInventoryDetails }) {
+                    Text(if (showInventoryDetails) "Скрыть описание" else "О предмете")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { selectedInventoryItem = null }) { Text("Закрыть") }
+            }
+        )
+    }
+
     // ДИАЛОГ ДОБАВЛЕНИЯ ПРЕДМЕТА
 
     if (showAddDialog) {
@@ -883,6 +1098,13 @@ fun GameScreen(
                             Text("Название предмета")
                         },
                         singleLine = true
+                    )
+
+                    OutlinedTextField(
+                        value = itemDescription,
+                        onValueChange = { itemDescription = it },
+                        label = { Text("Описание предмета") },
+                        minLines = 2
                     )
 
                     Row(
@@ -916,6 +1138,7 @@ fun GameScreen(
                         inventoryItems.add(
                             InventoryItem(
                                 name = itemName.trim(),
+                                description = itemDescription.trim(),
                                 quantity = if (hasQuantity) {
                                     itemQuantity.trim()
                                 } else {
@@ -925,9 +1148,11 @@ fun GameScreen(
                         )
 
                         saveInventory()
+                        onEvent("Добавил предмет «${itemName.trim()}»")
                         showAddDialog = false
 
                         itemName = ""
+                        itemDescription = ""
                         itemQuantity = ""
                         hasQuantity = false
                     }
@@ -1045,6 +1270,7 @@ fun GameScreen(
                             attributeValue.toIntOrNull() ?: 10
 
                         saveAttributes()
+                        onEvent("Изменил характеристику «$attribute» на ${attributes[attribute]}")
                         editingAttribute = null
                     },
                     enabled = attributeValue.isNotBlank()
@@ -1103,7 +1329,8 @@ private fun AttributeDiamond(
 @Composable
 fun AbilitiesScreen(
     character: Character,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onEvent: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
 
@@ -1159,6 +1386,7 @@ fun AbilitiesScreen(
                 if (!inCombat) {
                     inCombat = true
                     saveCombat()
+                    onEvent("Начал бой")
                 } else {
                     abilities.indices.forEach { index ->
                         abilities[index] = abilities[index].copy(isUsed = false)
@@ -1166,6 +1394,7 @@ fun AbilitiesScreen(
                     inCombat = false
                     saveAbilities()
                     saveCombat()
+                    onEvent("Закончил бой")
                 }
             },
             modifier = Modifier.fillMaxWidth()
@@ -1261,6 +1490,7 @@ fun AbilitiesScreen(
                                 if (index != -1 && inCombat && !abilities[index].isUsed) {
                                     abilities[index] = abilities[index].copy(isUsed = true)
                                     saveAbilities()
+                                    onEvent("Использовал способность «${ability.name}»")
                                 }
                             },
                             enabled = isAvailable && !deleteMode,
@@ -1298,6 +1528,7 @@ fun AbilitiesScreen(
                                         // Перезаряжаем только эту способность.
                                         abilities[index] = abilities[index].copy(isUsed = false)
                                         saveAbilities()
+                                        onEvent("Перезарядил способность «${ability.name}»")
                                     }
                                 },
                                 enabled = inCombat && ability.isUsed && !deleteMode,
@@ -1463,6 +1694,7 @@ fun AbilitiesScreen(
                             )
                         )
                         saveAbilities()
+                        onEvent("Добавил способность «${abilityName.trim()}»")
                         showAddDialog = false
                     }
                 ) {
@@ -1488,6 +1720,7 @@ fun AbilitiesScreen(
                     onClick = {
                         abilities.removeAll { it.id == ability.id }
                         saveAbilities()
+                        onEvent("Удалил способность «${ability.name}»")
                         abilityForDelete = null
                     }
                 ) {
