@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -44,29 +46,15 @@ fun CreateCharacterScreen(
         mutableStateOf(character?.profession ?: "Воин")
     }
 
-    var raceMenuExpanded by remember { mutableStateOf(false) }
-    var professionMenuExpanded by remember { mutableStateOf(false) }
+    var showRaceCatalog by remember { mutableStateOf(false) }
+    var showProfessionCatalog by remember { mutableStateOf(false) }
 
     val isEditing = character != null
-
-    val races = listOf(
-        "Человек",
-        "Эльф",
-        "Гном",
-        "Орк",
-        "Драконорождённый"
-    )
-
-    val professions = listOf(
-        "Воин",
-        "Маг",
-        "Вор",
-        "Ремесленник"
-    )
 
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         verticalArrangement = Arrangement.Top
     ) {
@@ -91,86 +79,28 @@ fun CreateCharacterScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        ExposedDropdownMenuBox(
-            expanded = raceMenuExpanded,
-            onExpandedChange = {
-                raceMenuExpanded = it
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            OutlinedTextField(
-                value = selectedRace,
-                onValueChange = {},
-                readOnly = true,
-                label = { Text("Раса") },
-                trailingIcon = {
-                    ExposedDropdownMenuDefaults.TrailingIcon(
-                        expanded = raceMenuExpanded
-                    )
-                },
-                modifier = Modifier
-                    .menuAnchor()
-                    .fillMaxWidth()
-            )
-
-            DropdownMenu(
-                expanded = raceMenuExpanded,
-                onDismissRequest = {
-                    raceMenuExpanded = false
-                }
-            ) {
-                races.forEach { race ->
-                    DropdownMenuItem(
-                        text = { Text(race) },
-                        onClick = {
-                            selectedRace = race
-                            raceMenuExpanded = false
-                        }
-                    )
-                }
-            }
+        OutlinedTextField(
+            value = selectedRace,
+            onValueChange = { selectedRace = it.take(80) },
+            label = { Text("Раса (можно свою)") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+        Button(onClick = { showRaceCatalog = true }, modifier = Modifier.fillMaxWidth()) {
+            Text("📚 Выбрать расу из базы (${RpgCatalog.races.size})")
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        ExposedDropdownMenuBox(
-            expanded = professionMenuExpanded,
-            onExpandedChange = {
-                professionMenuExpanded = it
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            OutlinedTextField(
-                value = selectedProfession,
-                onValueChange = {},
-                readOnly = true,
-                label = { Text("Профессия") },
-                trailingIcon = {
-                    ExposedDropdownMenuDefaults.TrailingIcon(
-                        expanded = professionMenuExpanded
-                    )
-                },
-                modifier = Modifier
-                    .menuAnchor()
-                    .fillMaxWidth()
-            )
-
-            DropdownMenu(
-                expanded = professionMenuExpanded,
-                onDismissRequest = {
-                    professionMenuExpanded = false
-                }
-            ) {
-                professions.forEach { profession ->
-                    DropdownMenuItem(
-                        text = { Text(profession) },
-                        onClick = {
-                            selectedProfession = profession
-                            professionMenuExpanded = false
-                        }
-                    )
-                }
-            }
+        OutlinedTextField(
+            value = selectedProfession,
+            onValueChange = { selectedProfession = it.take(80) },
+            label = { Text("Класс / профессия (можно свой)") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+        Button(onClick = { showProfessionCatalog = true }, modifier = Modifier.fillMaxWidth()) {
+            Text("📚 Выбрать класс из базы (${RpgCatalog.professions.size})")
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -188,7 +118,8 @@ fun CreateCharacterScreen(
                         level = character?.level ?: 1,
                         experience = character?.experience ?: 0,
                         experienceRequired = character?.experienceRequired ?: experienceForLevel(1),
-                        autoExperience = character?.autoExperience ?: true
+                        autoExperience = character?.autoExperience ?: true,
+                        prestigePoints = character?.prestigePoints ?: 0
                     )
 
                     onCreate(updatedCharacter)
@@ -214,4 +145,16 @@ fun CreateCharacterScreen(
             Text("Назад")
         }
     }
+    if (showRaceCatalog) RpgCatalogPickerDialog(
+        title = "База рас",
+        entries = RpgCatalog.races,
+        onSelect = { selectedRace = it.name; showRaceCatalog = false },
+        onDismiss = { showRaceCatalog = false }
+    )
+    if (showProfessionCatalog) RpgCatalogPickerDialog(
+        title = "База классов и профессий",
+        entries = RpgCatalog.professions,
+        onSelect = { selectedProfession = it.name; showProfessionCatalog = false },
+        onDismiss = { showProfessionCatalog = false }
+    )
 }

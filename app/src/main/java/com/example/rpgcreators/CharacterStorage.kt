@@ -34,6 +34,7 @@ object CharacterStorage {
                 put("experience", character.experience)
                 put("experienceRequired", character.experienceRequired)
                 put("autoExperience", character.autoExperience)
+                put("prestigePoints", character.prestigePoints)
             })
         }
         preferences(context).edit()
@@ -52,11 +53,12 @@ object CharacterStorage {
                     name = item.getString("name"),
                     race = item.getString("race"),
                     profession = item.getString("profession"),
-                    level = item.optInt("level", 1).coerceAtLeast(1),
+                    level = item.optInt("level", 1).coerceIn(1, MAX_CHARACTER_LEVEL),
                     experience = item.optInt("experience", 0).coerceAtLeast(0),
                     experienceRequired = item.optInt("experienceRequired", 250).coerceAtLeast(1),
                     // Legacy characters had a freely configured fixed threshold.
-                    autoExperience = item.optBoolean("autoExperience", false)
+                    autoExperience = item.optBoolean("autoExperience", false),
+                    prestigePoints = item.optInt("prestigePoints", 0).coerceAtLeast(0)
                 )
             }
         } catch (_: Exception) {
@@ -318,5 +320,6 @@ object CharacterStorage {
             .forEach { editor.remove(it) }
 
         editor.apply()
+        SkillTreeStorage.clear(context, characterId)
     }
 }

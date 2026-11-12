@@ -164,8 +164,13 @@ fun AppScreen(modifier: Modifier = Modifier) {
                 character = character,
                 onBack = { currentScreen = "details" },
                 onAbilities = { currentScreen = "abilities" },
+                onTalents = { currentScreen = "talents" },
                 onMaps = { currentScreen = "maps" }
             )
+        }
+
+        "talents" -> selectedCharacter?.let { character ->
+            SkillTreeScreen(character = character, onBack = { currentScreen = "game" })
         }
 
         "abilities" -> selectedCharacter?.let { character ->
@@ -472,13 +477,11 @@ fun CharacterDetailsScreen(
                     onClick = {
                         val max = maximumInput.toIntOrNull() ?: character.experienceRequired
                         val total = character.experience
-                        val extraLevels = total / max
                         val updated = character.copy(
-                            level = (character.level.toLong() + extraLevels).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                            experience = total % max,
+                            experience = 0,
                             experienceRequired = max,
                             autoExperience = false
-                        )
+                        ).addExperience(total)
                         onUpdateCharacter(updated)
                         showMaximumDialog = false
                     }
@@ -506,7 +509,12 @@ fun CharacterDetailsScreen(
         Text("Раса: ${character.race}", fontSize = 18.sp)
         Text("Профессия: ${character.profession}", fontSize = 18.sp)
 
-        Text("Уровень ${character.level}", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Text("Уровень ${character.level} / $MAX_CHARACTER_LEVEL", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        if (character.level == MAX_CHARACTER_LEVEL) {
+            Text("Максимальный уровень. Каждые ${character.experienceRequired} XP дают +$POST_CAP_TREE_POINTS очка древа.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+            Text("Дополнительных очков после 20 уровня: ${character.prestigePoints}")
+        }
         Text("${character.experience}/${character.experienceRequired} опыта", fontSize = 18.sp)
         LinearProgressIndicator(
             progress = { character.experience.toFloat() / character.experienceRequired.coerceAtLeast(1) },
@@ -626,6 +634,7 @@ fun GameScreen(
     character: Character,
     onBack: () -> Unit,
     onAbilities: () -> Unit,
+    onTalents: () -> Unit = {},
     onMaps: () -> Unit,
     showNavigation: Boolean = true,
     onEvent: (String) -> Unit = {}
@@ -674,6 +683,8 @@ fun GameScreen(
         }
     }
 
+    val talentBonuses = SkillTreeEngine.bonus(character, SkillTreeStorage.load(context, character.id))
+    var showInventoryCatalog by remember { mutableStateOf(false) }
     var showAddDialog by remember { mutableStateOf(false) }
     var deleteMode by remember { mutableStateOf(false) }
 
@@ -749,6 +760,11 @@ fun GameScreen(
             }
         }
 
+        if (showNavigation) OutlinedButton(
+            onClick = onTalents,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("✧ Древо навыков") }
+
         // ЭКИПИРОВКА
 
         Card(Modifier.fillMaxWidth()) {
@@ -818,6 +834,11 @@ fun GameScreen(
                     fontSize = 21.sp,
                     fontWeight = FontWeight.Bold
                 )
+                if (talentBonuses.isNotEmpty()) Text(
+                    "С учётом древа: " + talentBonuses.entries.joinToString { "${it.key} +${it.value}" },
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.primary
+                )
 
                 Row(
                     Modifier.fillMaxWidth(),
@@ -826,7 +847,7 @@ fun GameScreen(
                     defaultAttributes.take(3).forEach { attribute ->
                         AttributeDiamond(
                             attribute,
-                            attributes[attribute] ?: 10,
+                            (attributes[attribute] ?: 10) + (talentBonuses[attribute] ?: 0),
                             modifier = Modifier.weight(1f)
                         ) {
                             editingAttribute = attribute
@@ -843,7 +864,7 @@ fun GameScreen(
                     defaultAttributes.drop(3).forEach { attribute ->
                         AttributeDiamond(
                             attribute,
-                            attributes[attribute] ?: 10,
+                            (attributes[attribute] ?: 10) + (talentBonuses[attribute] ?: 0),
                             modifier = Modifier.weight(1f)
                         ) {
                             editingAttribute = attribute
@@ -1091,6 +1112,7 @@ fun GameScreen(
                 Column(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    TextButton(onClick = { showInventoryCatalog = true }) { Text("📚 Выбрать предмет из библиотеки") }
                     OutlinedTextField(
                         itemName,
                         { itemName = it },
@@ -1171,6 +1193,17 @@ fun GameScreen(
             }
         )
     }
+
+    if (showInventoryCatalog) RpgCatalogPickerDialog(
+        title = "База предметов",
+        entries = RpgEquipmentAbilitiesCatalog.items,
+        onSelect = { chosen ->
+            itemName = chosen.name
+            itemDescription = chosen.description
+            showInventoryCatalog = false
+        },
+        onDismiss = { showInventoryCatalog = false }
+    )
 
     // ДИАЛОГ ЭКИПИРОВКИ
 
@@ -1348,6 +1381,7 @@ fun AbilitiesScreen(
     var deleteMode by remember { mutableStateOf(false) }
     var abilityForDelete by remember { mutableStateOf<Ability?>(null) }
 
+    var showAbilityCatalog by remember { mutableStateOf(false) }
     var abilityName by remember { mutableStateOf("") }
     var abilityDescription by remember { mutableStateOf("") }
     var hasActivator by remember { mutableStateOf(false) }
@@ -1608,6 +1642,7 @@ fun AbilitiesScreen(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    TextButton(onClick = { showAbilityCatalog = true }) { Text("📚 Выбрать способность из библиотеки") }
                     OutlinedTextField(
                         value = abilityName,
                         onValueChange = { abilityName = it },
@@ -1709,6 +1744,17 @@ fun AbilitiesScreen(
         )
     }
 
+    if (showAbilityCatalog) RpgCatalogPickerDialog(
+        title = "База способностей",
+        entries = RpgEquipmentAbilitiesCatalog.abilities,
+        onSelect = { chosen ->
+            abilityName = chosen.name
+            abilityDescription = chosen.description
+            showAbilityCatalog = false
+        },
+        onDismiss = { showAbilityCatalog = false }
+    )
+
     // ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ
     abilityForDelete?.let { ability ->
         AlertDialog(
@@ -1806,6 +1852,10 @@ fun MapLibraryScreen(
                         modifier = Modifier.fillMaxWidth().height(190.dp)
                     )
                     Text(map.name, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+                    if ("Сетевая" in map.tags) {
+                        Text("🌐 Сетевая · доступна без подключения",
+                            fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(onClick = { onOpenMap(map) }, modifier = Modifier.weight(1f)) {
                             Text("Открыть")
@@ -1934,6 +1984,7 @@ fun MapDetailsScreen(
     var markerName by remember { mutableStateOf("") }
     var markerDescription by remember { mutableStateOf("") }
     var selectedMarker by remember { mutableStateOf<MapMarker?>(null) }
+    var showMarkerCatalog by remember { mutableStateOf(false) }
 
     // Сохраняем исходные настройки окна и возвращаем их при выходе с экрана карты.
     DisposableEffect(activity) {
@@ -1968,16 +2019,11 @@ fun MapDetailsScreen(
         CharacterStorage.saveCharacterMapMarkers(context, character.id, map.id, markers.toList())
     }
 
-    val markerTypes = listOf(
-        "Обычная" to "📍",
-        "Сундук" to "📦",
-        "Враг" to "⚔️",
-        "NPC" to "👤",
-        "Задание" to "📜",
-        "Босс" to "💀",
-        "Опасность" to "⚠️",
-        "Другое" to "◆"
-    )
+    val markerTypes = remember {
+        listOf("Обычная", "Сундук", "Враг", "NPC", "Босс", "Опасность",
+            "Игрок", "Атака", "Защита", "Укрытие", "Задание", "Другое")
+            .map { it to RpgCatalog.markerIcon(it) }
+    }
 
     if (!isFullscreen) {
         Column(
@@ -2014,7 +2060,7 @@ fun MapDetailsScreen(
                 markers.forEachIndexed { index, marker ->
                     Card(Modifier.fillMaxWidth().clickable { selectedMarker = marker }) {
                         Column(Modifier.padding(12.dp)) {
-                            Text("${markerTypes.firstOrNull { it.first == marker.type }?.second ?: "📍"}  ${index + 1}. ${marker.name}", fontWeight = FontWeight.SemiBold)
+                            Text("${RpgCatalog.markerIcon(marker.type)}  ${index + 1}. ${marker.name}", fontWeight = FontWeight.SemiBold)
                             if (marker.description.isNotBlank()) Text(marker.description, fontSize = 13.sp)
                         }
                     }
@@ -2066,7 +2112,7 @@ fun MapDetailsScreen(
                 )
 
                 markers.forEachIndexed { index, marker ->
-                    val markerEmoji = markerTypes.firstOrNull { it.first == marker.type }?.second ?: "📍"
+                    val markerEmoji = RpgCatalog.markerIcon(marker.type)
                     Box(
                         Modifier
                             .offset(
@@ -2221,7 +2267,8 @@ fun MapDetailsScreen(
                 }
             }
 
-            // Плавающая кнопка и раскрывающаяся мини-панель типов меток.
+            // Компактная панель вместо широкой сетки FilterChip, вылезавшей за экран.
+            // В альбомной ориентации видны кнопка каталога и небольшой прокручиваемый список.
             Column(
                 Modifier.align(Alignment.BottomStart).padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -2229,23 +2276,45 @@ fun MapDetailsScreen(
             ) {
                 if (toolsExpanded) {
                     Card(
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)),
+                        modifier = Modifier.width(260.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
+                        ),
                         elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
                     ) {
-                        Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text("Тип метки", fontWeight = FontWeight.Bold)
-                            markerTypes.chunked(4).forEach { rowTypes ->
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    rowTypes.forEach { (type, emoji) ->
-                                        FilterChip(
-                                            selected = selectedType == type,
-                                            onClick = {
-                                                selectedType = type
-                                                waitingForMapTap = true
-                                                toolsExpanded = false
-                                            },
-                                            label = { Text("$emoji $type", fontSize = 11.sp) }
-                                        )
+                        Column(
+                            Modifier.padding(9.dp),
+                            verticalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Text("Добавить метку", fontWeight = FontWeight.Bold)
+                            TextButton(
+                                onClick = {
+                                    toolsExpanded = false
+                                    showMarkerCatalog = true
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("📚 Выбрать из каталога") }
+                            HorizontalDivider()
+                            Text(
+                                "Или выбрать только тип:",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Column(
+                                Modifier.fillMaxWidth().heightIn(max = 120.dp)
+                                    .verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(0.dp)
+                            ) {
+                                markerTypes.forEach { (type, emoji) ->
+                                    TextButton(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        onClick = {
+                                            selectedType = type
+                                            waitingForMapTap = true
+                                            toolsExpanded = false
+                                        }
+                                    ) {
+                                        Text("$emoji  $type", modifier = Modifier.fillMaxWidth(), maxLines = 1)
                                     }
                                 }
                             }
@@ -2292,6 +2361,8 @@ fun MapDetailsScreen(
                             )
                         )
                         saveMarkers()
+                        markerName = ""
+                        markerDescription = ""
                         pendingPosition = null
                     }
                 ) { Text("Сохранить") }
@@ -2302,10 +2373,24 @@ fun MapDetailsScreen(
         )
     }
 
+    if (showMarkerCatalog) RpgCatalogPickerDialog(
+        title = "Шаблоны меток и противников",
+        entries = RpgCatalog.markerPresets,
+        onSelect = { preset ->
+            selectedType = preset.markerType
+            markerName = preset.name
+            markerDescription = preset.description
+            waitingForMapTap = true
+            toolsExpanded = false
+            showMarkerCatalog = false
+        },
+        onDismiss = { showMarkerCatalog = false }
+    )
+
     selectedMarker?.let { marker ->
         AlertDialog(
             onDismissRequest = { selectedMarker = null },
-            title = { Text("${markerTypes.firstOrNull { it.first == marker.type }?.second ?: "📍"} ${marker.name}") },
+            title = { Text("${RpgCatalog.markerIcon(marker.type)} ${marker.name}") },
             text = {
                 Text(marker.description.ifBlank { "Тип: ${marker.type}\nДля этой метки нет описания." })
             },

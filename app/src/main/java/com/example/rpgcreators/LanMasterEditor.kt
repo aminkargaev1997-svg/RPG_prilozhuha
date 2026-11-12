@@ -34,6 +34,7 @@ internal fun MasterObservationDialog(
     var extra3 by remember(playerId) { mutableStateOf("") }
     var checked by remember(playerId) { mutableStateOf(false) }
     var feedback by remember(playerId) { mutableStateOf("") }
+    var identityCatalog by remember(playerId) { mutableStateOf("") }
 
     fun send(operation: String, data: JSONObject, description: String) {
         feedback = if (onEdit(operation, data, description)) "Изменение отправлено игроку" else
@@ -60,6 +61,7 @@ internal fun MasterObservationDialog(
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(selected = tab == "character", onClick = { tab = "character" }, label = { Text("Персонаж") })
                         FilterChip(selected = tab == "abilities", onClick = { tab = "abilities" }, label = { Text("Способности") })
+                        FilterChip(selected = tab == "tree", onClick = { tab = "tree" }, label = { Text("Древо") })
                     }
                     if (snapshot == null) {
                         Text("Ожидаем сведения от игрока. Он должен выбрать персонажа в комнате.")
@@ -73,7 +75,7 @@ internal fun MasterObservationDialog(
                             extra = snapshot.optString("profession")
                         }) { Text("✎ Изменить данные персонажа") }
                         HorizontalDivider()
-                        Text("Уровень ${snapshot.optInt("level")}  ·  Опыт ${snapshot.optInt("experience")}/${snapshot.optInt("experienceRequired")}", fontWeight = FontWeight.Bold)
+                        Text("Уровень ${snapshot.optInt("level")}/20  ·  Опыт ${snapshot.optInt("experience")}/${snapshot.optInt("experienceRequired")}", fontWeight = FontWeight.Bold)
                         Text(if (snapshot.optBoolean("autoExperience", false))
                             "Автоматический рост: 650 + 750 × (уровень − 1)" else "Ручной максимум опыта", fontSize = 12.sp)
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -144,6 +146,37 @@ internal fun MasterObservationDialog(
                                 Text("$slot: $equippedName  ✎", modifier = Modifier.fillMaxWidth())
                             }
                         }
+                    } else if (tab == "tree") {
+                        val currentCharacter = Character(
+                            id = snapshot.optLong("id"),
+                            name = snapshot.optString("name"), race = snapshot.optString("race"),
+                            profession = snapshot.optString("profession"),
+                            level = snapshot.optInt("level", 1).coerceIn(1, MAX_CHARACTER_LEVEL),
+                            prestigePoints = snapshot.optInt("prestigePoints", 0))
+                        val talentTree = snapshot.optJSONObject("tree") ?: JSONObject()
+                        val learnedArray = talentTree.optJSONArray("nodes") ?: JSONArray()
+                        val pointsGranted = talentTree.optInt("granted", 0)
+                        val learned = (0 until learnedArray.length()).map { learnedArray.optString(it) }.toSet()
+                        val points = TalentState(learned, pointsGranted)
+                        val allNodes = SkillTreeEngine.nodes(currentCharacter)
+                        Text("Уровень ${currentCharacter.level}/20 · Потрачено ${SkillTreeEngine.spent(allNodes, points)}", fontWeight = FontWeight.Bold)
+                        Text("Доступно очков: ${SkillTreeEngine.totalPoints(currentCharacter, points) - SkillTreeEngine.spent(allNodes, points)}")
+                        Text("После 20 уровня: ${currentCharacter.prestigePoints} дополнительных очков")
+                        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                            TextButton(onClick = { send("skill_points", JSONObject().put("value", 1), "Выдал 1 очко развития") }) { Text("+1 очко") }
+                            TextButton(onClick = { send("skill_points", JSONObject().put("value", 5), "Выдал 5 очков развития") }) { Text("+5 очков") }
+                            TextButton(onClick = { send("skill_reset", JSONObject(), "Сбросил древо игрока") }) { Text("Сброс") }
+                        }
+                        Text("Изученные навыки", fontWeight = FontWeight.Bold)
+                        allNodes.filter { it.id in learned }.forEach { node ->
+                            Text("• ${node.title}", fontSize = 12.sp)
+                        }
+                        HorizontalDivider()
+                        Text("Доступные для изучения", fontWeight = FontWeight.Bold)
+                        allNodes.filter { SkillTreeEngine.canLearn(currentCharacter, points, it, allNodes) }.take(20).forEach { node ->
+                            TextButton(onClick = { send("skill_learn", JSONObject().put("id", node.id), "Изучил узел «${node.title}»") },
+                                modifier = Modifier.fillMaxWidth()) { Text("+ ${node.title} (${node.tier.cost})") }
+                        }
                     } else {
                         Text("Способности", fontWeight = FontWeight.Bold)
                         if (abilities.length() == 0) Text("Способностей нет")
@@ -174,7 +207,9 @@ internal fun MasterObservationDialog(
                         "identity" -> {
                             MasterEditTextField(fieldName, { fieldName = it.take(80) }, "Имя")
                             MasterEditTextField(fieldValue, { fieldValue = it.take(80) }, "Раса")
+                            TextButton(onClick = { identityCatalog = "race" }) { Text("📚 Расы из базы") }
                             MasterEditTextField(extra, { extra = it.take(80) }, "Класс")
+                            TextButton(onClick = { identityCatalog = "class" }) { Text("📚 Классы и профессии из базы") }
                         }
                         "level", "grant_xp", "set_xp", "max_xp" -> {
                             val title = when (editing) {
@@ -190,11 +225,13 @@ internal fun MasterObservationDialog(
                             MasterEditTextField(fieldValue, { fieldValue = it.filter { c -> c.isDigit() || c == '-' }.take(7) }, "Значение")
                         }
                         "item" -> {
+                            TextButton(onClick = { identityCatalog = "item" }) { Text("📚 Предметы из базы") }
                             MasterEditTextField(fieldName, { fieldName = it.take(100) }, "Название предмета")
                             MasterEditTextField(fieldValue, { fieldValue = it.take(60) }, "Количество")
                             MasterEditTextField(extra, { extra = it.take(500) }, "Описание")
                         }
                         "ability" -> {
+                            TextButton(onClick = { identityCatalog = "ability" }) { Text("📚 Способности из базы") }
                             MasterEditTextField(fieldName, { fieldName = it.take(100) }, "Название способности")
                             MasterEditTextField(fieldValue, { fieldValue = it.take(500) }, "Описание")
                             MasterEditTextField(extra, { extra = it.take(500) }, "Активный эффект")
@@ -235,7 +272,7 @@ internal fun MasterObservationDialog(
                 val canSave = when (editing) {
                     "identity" -> fieldName.isNotBlank() && fieldValue.isNotBlank() && extra.isNotBlank()
                     "attribute" -> fieldName.isNotBlank() && numeric != null && numeric in -100_000..100_000
-                    "level" -> numeric != null && numeric in 1..1_000_000
+                    "level" -> numeric != null && numeric in 1..MAX_CHARACTER_LEVEL
                     "grant_xp", "max_xp" -> numeric != null && numeric > 0
                     "set_xp" -> numeric != null && numeric >= 0
                     "item", "ability" -> fieldName.isNotBlank()
@@ -270,6 +307,30 @@ internal fun MasterObservationDialog(
         dismissButton = {
             if (editing.isNotEmpty()) TextButton(onClick = { editing = "" }) { Text("Назад") }
         }
+    )
+    if (identityCatalog.isNotBlank()) RpgCatalogPickerDialog(
+        title = when(identityCatalog) {
+            "race" -> "База рас"
+            "class" -> "База классов"
+            "item" -> "База предметов"
+            else -> "База способностей"
+        },
+        entries = when(identityCatalog) {
+            "race" -> RpgCatalog.races
+            "class" -> RpgCatalog.professions
+            "item" -> RpgEquipmentAbilitiesCatalog.items
+            else -> RpgEquipmentAbilitiesCatalog.abilities
+        },
+        onSelect = { entry ->
+            when(identityCatalog) {
+                "race" -> fieldValue = entry.name
+                "class" -> extra = entry.name
+                "item" -> { fieldName = entry.name; extra = entry.description }
+                "ability" -> { fieldName = entry.name; fieldValue = entry.description }
+            }
+            identityCatalog = ""
+        },
+        onDismiss = { identityCatalog = "" }
     )
 }
 

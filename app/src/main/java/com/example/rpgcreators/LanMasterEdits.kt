@@ -35,7 +35,7 @@ internal fun applyLanMasterEdit(
             }
             "level" -> {
                 val level = data.optInt("value", 0)
-                if (level !in 1..1_000_000) return false
+                if (level !in 1..MAX_CHARACTER_LEVEL) return false
                 onCharacterUpdate(original.withLevel(level))
             }
             "grant_xp" -> {
@@ -65,6 +65,26 @@ internal fun applyLanMasterEdit(
                     experience = original.experience.coerceAtMost(required - 1),
                     autoExperience = true
                 ))
+            }
+            "skill_points" -> {
+                val delta = data.optInt("value", Int.MIN_VALUE)
+                if (delta !in -1000..1000) return false
+                val current = SkillTreeStorage.load(context, edit.characterId)
+                SkillTreeStorage.save(context, edit.characterId, current.copy(
+                    grantedPoints = (current.grantedPoints + delta).coerceIn(-100_000, 100_000)))
+            }
+            "skill_reset" -> {
+                val current = SkillTreeStorage.load(context, edit.characterId)
+                SkillTreeStorage.save(context, edit.characterId, SkillTreeEngine.reset(current))
+            }
+            "skill_learn" -> {
+                val requested = data.optString("id")
+                val nodes = SkillTreeEngine.nodes(original)
+                val node = nodes.firstOrNull { it.id == requested } ?: return false
+                val current = SkillTreeStorage.load(context, edit.characterId)
+                if (!SkillTreeEngine.canLearn(original, current, node, nodes)) return false
+                SkillTreeStorage.save(context, edit.characterId,
+                    SkillTreeEngine.learn(original, current, node, nodes))
             }
             "attribute" -> {
                 val name = data.optString("name").trim().take(60)

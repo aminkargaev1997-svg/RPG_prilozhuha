@@ -6,7 +6,10 @@ import android.app.Activity
 import android.content.pm.ActivityInfo
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.Intent
 import android.view.View
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.LinearEasing
@@ -53,7 +56,9 @@ fun LanGameScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val maps = remember { CharacterStorage.loadMaps(context) }
+    val maps = remember {
+        mutableStateListOf<GameMap>().apply { addAll(CharacterStorage.loadMaps(context)) }
+    }
     var selectedCharacterId by remember { mutableStateOf(characters.firstOrNull()?.id) }
     var selectedMapId by remember { mutableStateOf(maps.firstOrNull()?.id) }
     var ip by remember { mutableStateOf("") }
@@ -81,6 +86,14 @@ fun LanGameScreen(
     var markerName by remember { mutableStateOf("") }
     var markerDescription by remember { mutableStateOf("") }
     var markerType by remember { mutableStateOf("Обычная") }
+    var showMarkerCatalog by remember { mutableStateOf(false) }
+    var mapBeingAdded by remember { mutableStateOf<Uri?>(null) }
+    var newMapName by remember { mutableStateOf("") }
+    var showAddMapChooser by remember { mutableStateOf(false) }
+    var roomMapMenu by remember { mutableStateOf(false) }
+    var mapForRoomRemoval by remember { mutableStateOf<LanRoomMapInfo?>(null) }
+    var loadingMap by remember { mutableStateOf(false) }
+    var mapError by remember { mutableStateOf<String?>(null) }
     var selectedGuestCharacterId by remember { mutableStateOf(characters.firstOrNull()?.id) }
     val activeCharacter = characters.firstOrNull {
         it.id == (if (mode == "host") selectedCharacterId else selectedGuestCharacterId)
@@ -97,6 +110,43 @@ fun LanGameScreen(
             applied
         })
     }
+    val uploadRoomMap: (GameMap, Boolean) -> Unit = { map, startRoom ->
+        if (!loadingMap) {
+            loadingMap = true
+            scope.launch {
+                try {
+                    val bytes = LanRoomStorage.readImage(context, map.imageUri)
+                    val initialMarkers = activeCharacter?.let { owner ->
+                        CharacterStorage.loadCharacterMapMarkers(context, owner.id, map.id)
+                            .filter { it.id != LanRoomStorage.playerPositionId() }.map { marker ->
+                            LanMarker(UUID.randomUUID().toString(), marker.name, marker.description,
+                                marker.type, marker.x, marker.y, "host")
+                        }
+                    } ?: emptyList()
+                    if (startRoom) {
+                        started = true
+                        session.host("Мастер", map.id.toString(), map.name, bytes, initialMarkers)
+                    } else if (!withContext(Dispatchers.IO) {
+                            session.addMap(map.id.toString(), map.name, bytes, initialMarkers)
+                        }) {
+                        error("Карта уже в комнате или достигнут лимит $LAN_MAX_ROOM_MAPS карт")
+                    }
+                } catch (error: Exception) {
+                    mapError = error.message ?: "Не удалось добавить карту"
+                    if (startRoom) started = false
+                } finally { loadingMap = false }
+            }
+        }
+    }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: SecurityException) { }
+            newMapName = ""
+            mapBeingAdded = uri
+        }
+    }
     val activity = remember(context) {
         var current: Context = context
         while (current is ContextWrapper && current !is Activity) current = current.baseContext
@@ -108,9 +158,9 @@ fun LanGameScreen(
         if (fullscreen) {
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
             activity?.window?.decorView?.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    )
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            )
         }
         onDispose {
             if (oldOrientation != null) activity?.requestedOrientation = oldOrientation
@@ -124,6 +174,56 @@ fun LanGameScreen(
             try { BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }
             catch (_: Exception) { null }
         }
+    }
+
+    // Each player's phone keeps an offline network copy of every received map.
+    // Markers stay separate for each character, including the last player position.
+    LaunchedEffect(state.roomMaps, state.roomMarkers, state.players, state.activeMapId,
+        state.myId, activeCharacter?.id, state.roomId) {
+        val character = activeCharacter ?: return@LaunchedEffect
+        if (state.roomId.isBlank()) return@LaunchedEffect
+        delay(180)
+        val snapshots = state.roomMaps.mapNotNull { info ->
+            val sharedMarkers = state.roomMarkers[info.id] ?: return@mapNotNull null
+            Triple(info, sharedMarkers, if (info.id == state.activeMapId)
+                state.players.firstOrNull { it.id == state.myId } else null)
+        }
+        withContext(Dispatchers.IO) {
+            snapshots.forEach { (info, sharedMarkers, ownPosition) ->
+                val markers = sharedMarkers.map { item ->
+                    MapMarker(
+                        id = LanRoomStorage.markerId(state.roomId, info.id, item.id),
+                        name = item.name, description = item.description,
+                        type = item.type, x = item.x, y = item.y
+                    )
+                }.toMutableList()
+                val old = CharacterStorage.loadCharacterMapMarkers(context, character.id, info.localMapId)
+                    .firstOrNull { it.id == LanRoomStorage.playerPositionId() }
+                val lastPosition = ownPosition?.let { position ->
+                    MapMarker(id = LanRoomStorage.playerPositionId(),
+                        name = "Последняя позиция: ${character.name}",
+                        description = "Место персонажа в сетевой игре", type = "Игрок",
+                        x = position.x, y = position.y)
+                } ?: old
+                if (lastPosition != null) markers.add(lastPosition)
+                CharacterStorage.saveCharacterMapMarkers(context, character.id, info.localMapId, markers)
+            }
+        }
+    }
+    LaunchedEffect(state.permissions.skillTreeEnabled) {
+        if (!state.permissions.skillTreeEnabled && page == "talents") page = "map"
+    }
+    LaunchedEffect(state.activeMapId) {
+        movingPlayerId = null
+        movingOwnPlayer = false
+        moveMarkerId = null
+        previewPosition = null
+        selectedMarker = null
+        pendingPoint = null
+        addingMarker = false
+    }
+    LaunchedEffect(state.image) {
+        if (state.image == null) fullscreen = false
     }
 
     val currentCharacter by rememberUpdatedState(activeCharacter)
@@ -142,6 +242,10 @@ fun LanGameScreen(
                         put("profession", latest.profession); put("level", latest.level)
                         put("experience", latest.experience)
                         put("experienceRequired", latest.experienceRequired)
+                        put("prestigePoints", latest.prestigePoints)
+                        val talentState = SkillTreeStorage.load(context, latest.id)
+                        put("tree", JSONObject().put("nodes", JSONArray(talentState.unlocked.toList()))
+                            .put("granted", talentState.grantedPoints))
                         put("inventory", JSONArray().apply {
                             CharacterStorage.loadInventory(context, latest.id).forEach { item ->
                                 put(JSONObject().put("id", item.id).put("name", item.name).put("quantity", item.quantity)
@@ -223,6 +327,87 @@ fun LanGameScreen(
         )
     }
 
+    mapError?.let { error ->
+        AlertDialog(
+            onDismissRequest = { mapError = null },
+            title = { Text("Не удалось открыть карту") },
+            text = { Text(error) },
+            confirmButton = { TextButton(onClick = { mapError = null }) { Text("Понятно") } }
+        )
+    }
+
+    mapBeingAdded?.let { uri ->
+        AlertDialog(
+            onDismissRequest = { mapBeingAdded = null },
+            title = { Text("Добавить карту") },
+            text = {
+                OutlinedTextField(value = newMapName, onValueChange = { newMapName = it.take(80) },
+                    label = { Text("Название карты") }, singleLine = true)
+            },
+            confirmButton = {
+                TextButton(enabled = newMapName.isNotBlank() && !loadingMap, onClick = {
+                    val map = GameMap(name = newMapName.trim(), imageUri = uri.toString())
+                    maps.add(map)
+                    CharacterStorage.saveMaps(context, maps.toList())
+                    selectedMapId = map.id
+                    mapBeingAdded = null
+                    if (started && state.connected && isMaster) uploadRoomMap(map, false)
+                }) { Text(if (started) "Добавить в комнату" else "Сохранить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { mapBeingAdded = null }) { Text("Отмена") }
+            }
+        )
+    }
+
+    if (showAddMapChooser && isMaster && state.connected) {
+        val sourceMaps = maps.filter { source ->
+            state.roomMaps.none { it.id == source.id.toString() || it.localMapId == source.id }
+        }
+        AlertDialog(
+            onDismissRequest = { showAddMapChooser = false },
+            title = { Text("Новая карта комнаты") },
+            text = {
+                Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = {
+                        showAddMapChooser = false
+                        imagePicker.launch(arrayOf("image/*"))
+                    }, modifier = Modifier.fillMaxWidth()) { Text("🖼 Загрузить фото") }
+                    Text("Или выбери карту из библиотеки:")
+                    if (sourceMaps.isEmpty()) Text("Других карт пока нет")
+                    sourceMaps.forEach { map ->
+                        OutlinedButton(
+                            enabled = !loadingMap,
+                            onClick = {
+                                showAddMapChooser = false
+                                uploadRoomMap(map, false)
+                            }, modifier = Modifier.fillMaxWidth()
+                        ) { Text(map.name) }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showAddMapChooser = false }) { Text("Закрыть") } }
+        )
+    }
+
+    mapForRoomRemoval?.let { map ->
+        AlertDialog(
+            onDismissRequest = { mapForRoomRemoval = null },
+            title = { Text("Убрать карту из комнаты?") },
+            text = { Text("«${map.name}» исчезнет из текущей сетевой игры у всех игроков. Сохранённая карта и локальные метки на телефонах останутся.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (!session.removeMap(map.id)) mapError = "Не удалось удалить карту из комнаты"
+                    mapForRoomRemoval = null
+                }) { Text("Удалить из комнаты", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { mapForRoomRemoval = null }) { Text("Отмена") }
+            }
+        )
+    }
+
     if (showExperience && !isMaster && activeCharacter != null) {
         AlertDialog(
             onDismissRequest = { showExperience = false },
@@ -265,6 +450,12 @@ fun LanGameScreen(
                         Switch(checked = state.permissions.deleteOwnMarkers,
                             onCheckedChange = { session.setPermissions(state.permissions.copy(deleteOwnMarkers = it)) })
                     }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Использовать древо навыков", Modifier.weight(1f))
+                        Switch(checked = state.permissions.skillTreeEnabled,
+                            onCheckedChange = { session.setPermissions(state.permissions.copy(skillTreeEnabled = it)) })
+                    }
+                    Text("Отключённое древо скрыто для игроков этой сетевой кампании; личные навыки не удаляются.", fontSize = 12.sp)
                     Text("Мастер может управлять всеми метками.", fontSize = 12.sp)
                 }
             },
@@ -360,11 +551,14 @@ fun LanGameScreen(
                         value = markerDescription, onValueChange = { markerDescription = it.take(300) },
                         label = { Text("Описание") }
                     )
+                    OutlinedButton(onClick = { showMarkerCatalog = true }) {
+                        Text("📚 База меток и противников")
+                    }
                     var typesExpanded by remember { mutableStateOf(false) }
                     Box {
                         OutlinedButton(onClick = { typesExpanded = true }) { Text("${markerIcon(markerType)} $markerType") }
                         DropdownMenu(expanded = typesExpanded, onDismissRequest = { typesExpanded = false }) {
-                            listOf("Обычная", "Сундук", "Враг", "NPC", "Задание", "Босс", "Опасность", "Другое").forEach { type ->
+                            RpgCatalog.markerTypes.forEach { type ->
                                 DropdownMenuItem(text = { Text("${markerIcon(type)} $type") }, onClick = {
                                     markerType = type
                                     typesExpanded = false
@@ -390,86 +584,98 @@ fun LanGameScreen(
         )
     }
 
+    if (showMarkerCatalog && pendingPoint != null) RpgCatalogPickerDialog(
+        title = "Шаблоны меток и противников",
+        entries = RpgCatalog.markerPresets,
+        onSelect = { preset ->
+            markerName = preset.name
+            markerDescription = preset.description.take(300)
+            markerType = preset.markerType
+            showMarkerCatalog = false
+        },
+        onDismiss = { showMarkerCatalog = false }
+    )
+
     val mapContent: @Composable () -> Unit = {
         val image = bitmap
         if (image != null) {
-            val aspect = image.width.toFloat() / image.height.coerceAtLeast(1)
-            BoxWithConstraints(
-                Modifier.fillMaxWidth().aspectRatio(aspect)
-                    .border(1.dp, MaterialTheme.colorScheme.outline)
-            ) {
-                val widthPx = constraints.maxWidth.toFloat().coerceAtLeast(1f)
-                val heightPx = constraints.maxHeight.toFloat().coerceAtLeast(1f)
-                Image(
-                    bitmap = image,
-                    contentDescription = "Общая карта",
-                    modifier = Modifier.fillMaxSize()
-                        .pointerInput(session, addingMarker) {
-                            detectTapGestures { offset ->
-                                val x = (offset.x / size.width).coerceIn(0f, 1f)
-                                val y = (offset.y / size.height).coerceIn(0f, 1f)
-                                if (addingMarker && (isMaster || state.permissions.createMarkers)) {
-                                    pendingPoint = x to y
+                    val aspect = image.width.toFloat() / image.height.coerceAtLeast(1)
+                    BoxWithConstraints(
+                        Modifier.fillMaxWidth().aspectRatio(aspect)
+                            .border(1.dp, MaterialTheme.colorScheme.outline)
+                    ) {
+                        val widthPx = constraints.maxWidth.toFloat().coerceAtLeast(1f)
+                        val heightPx = constraints.maxHeight.toFloat().coerceAtLeast(1f)
+                        Image(
+                            bitmap = image,
+                            contentDescription = "Общая карта",
+                            modifier = Modifier.fillMaxSize()
+                                .pointerInput(session, addingMarker) {
+                                    detectTapGestures { offset ->
+                                        val x = (offset.x / size.width).coerceIn(0f, 1f)
+                                        val y = (offset.y / size.height).coerceIn(0f, 1f)
+                                        if (addingMarker && (isMaster || state.permissions.createMarkers)) {
+                                            pendingPoint = x to y
+                                        }
+                                    }
+                                },
+                            contentScale = ContentScale.FillBounds
+                        )
+                        state.markers.forEach { marker ->
+                            val drawX = if (moveMarkerId == marker.id) previewPosition?.first ?: marker.x else marker.x
+                            val drawY = if (moveMarkerId == marker.id) previewPosition?.second ?: marker.y else marker.y
+                            val smoothX by animateFloatAsState(
+                                targetValue = drawX,
+                                animationSpec = tween(durationMillis = 110, easing = LinearEasing),
+                                label = "markerX"
+                            )
+                            val smoothY by animateFloatAsState(
+                                targetValue = drawY,
+                                animationSpec = tween(durationMillis = 110, easing = LinearEasing),
+                                label = "markerY"
+                            )
+                            Box(
+                                Modifier.offset {
+                                    IntOffset(
+                                        (smoothX * widthPx).roundToInt() - 14.dp.roundToPx(),
+                                        (smoothY * heightPx).roundToInt() - 14.dp.roundToPx()
+                                    )
                                 }
-                            }
-                        },
-                    contentScale = ContentScale.FillBounds
-                )
-                state.markers.forEach { marker ->
-                    val drawX = if (moveMarkerId == marker.id) previewPosition?.first ?: marker.x else marker.x
-                    val drawY = if (moveMarkerId == marker.id) previewPosition?.second ?: marker.y else marker.y
-                    val smoothX by animateFloatAsState(
-                        targetValue = drawX,
-                        animationSpec = tween(durationMillis = 110, easing = LinearEasing),
-                        label = "markerX"
-                    )
-                    val smoothY by animateFloatAsState(
-                        targetValue = drawY,
-                        animationSpec = tween(durationMillis = 110, easing = LinearEasing),
-                        label = "markerY"
-                    )
-                    Box(
-                        Modifier.offset {
-                            IntOffset(
-                                (smoothX * widthPx).roundToInt() - 14.dp.roundToPx(),
-                                (smoothY * heightPx).roundToInt() - 14.dp.roundToPx()
+                                    .size(28.dp).clip(CircleShape)
+                                    .background(Color(0xFFFFC107))
+                                    .border(1.dp, Color.White, CircleShape)
+                                    .clickable { selectedMarker = marker },
+                                contentAlignment = Alignment.Center
+                            ) { Text(markerIcon(marker.type), fontSize = 15.sp) }
+                        }
+                        state.players.forEach { player ->
+                            val mine = player.id == state.myId
+                            val drawX = if (movingOwnPlayer && movingPlayerId == player.id) previewPosition?.first ?: player.x else player.x
+                            val drawY = if (movingOwnPlayer && movingPlayerId == player.id) previewPosition?.second ?: player.y else player.y
+                            val smoothX by animateFloatAsState(
+                                targetValue = drawX,
+                                animationSpec = tween(durationMillis = 110, easing = LinearEasing),
+                                label = "playerX"
+                            )
+                            val smoothY by animateFloatAsState(
+                                targetValue = drawY,
+                                animationSpec = tween(durationMillis = 110, easing = LinearEasing),
+                                label = "playerY"
+                            )
+                            Box(
+                                Modifier.offset {
+                                    IntOffset(
+                                        (smoothX * widthPx).roundToInt() - 13.dp.roundToPx(),
+                                        (smoothY * heightPx).roundToInt() - 13.dp.roundToPx()
+                                    )
+                                }
+                                    .size(26.dp).clip(CircleShape)
+                                    .background(if (mine) Color(0xFF00BFA5) else Color(0xFFE53935))
+                                    .border(2.dp, Color.White, CircleShape)
+                                    .clickable { selectedPlayer = player }
                             )
                         }
-                            .size(28.dp).clip(CircleShape)
-                            .background(Color(0xFFFFC107))
-                            .border(1.dp, Color.White, CircleShape)
-                            .clickable { selectedMarker = marker },
-                        contentAlignment = Alignment.Center
-                    ) { Text(markerIcon(marker.type), fontSize = 15.sp) }
-                }
-                state.players.forEach { player ->
-                    val mine = player.id == state.myId
-                    val drawX = if (movingOwnPlayer && movingPlayerId == player.id) previewPosition?.first ?: player.x else player.x
-                    val drawY = if (movingOwnPlayer && movingPlayerId == player.id) previewPosition?.second ?: player.y else player.y
-                    val smoothX by animateFloatAsState(
-                        targetValue = drawX,
-                        animationSpec = tween(durationMillis = 110, easing = LinearEasing),
-                        label = "playerX"
-                    )
-                    val smoothY by animateFloatAsState(
-                        targetValue = drawY,
-                        animationSpec = tween(durationMillis = 110, easing = LinearEasing),
-                        label = "playerY"
-                    )
-                    Box(
-                        Modifier.offset {
-                            IntOffset(
-                                (smoothX * widthPx).roundToInt() - 13.dp.roundToPx(),
-                                (smoothY * heightPx).roundToInt() - 13.dp.roundToPx()
-                            )
-                        }
-                            .size(26.dp).clip(CircleShape)
-                            .background(if (mine) Color(0xFF00BFA5) else Color(0xFFE53935))
-                            .border(2.dp, Color.White, CircleShape)
-                            .clickable { selectedPlayer = player }
-                    )
-                }
-            }
+                    }
         }
     }
 
@@ -525,14 +731,14 @@ fun LanGameScreen(
                     },
                 shape = CircleShape,
                 color = if (active) MaterialTheme.colorScheme.secondaryContainer
-                else MaterialTheme.colorScheme.surfaceVariant,
+                    else MaterialTheme.colorScheme.surfaceVariant,
                 tonalElevation = 5.dp
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Text(
                         "✥", fontSize = 54.sp,
                         color = if (active) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
+                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
                     )
                 }
             }
@@ -556,7 +762,41 @@ fun LanGameScreen(
         }
     }
 
-    if (fullscreen && state.connected && bitmap != null && page == "map") {
+    val roomMapControls: @Composable () -> Unit = {
+        if (isMaster) {
+            Box {
+                OutlinedButton(onClick = { roomMapMenu = true }) {
+                    Text("🗺 ${state.mapName.ifBlank { "Нет карты" }}", maxLines = 2)
+                }
+                DropdownMenu(expanded = roomMapMenu, onDismissRequest = { roomMapMenu = false }) {
+                    state.roomMaps.forEach { info ->
+                        DropdownMenuItem(
+                            text = { Text(if (info.id == state.activeMapId) "✓ ${info.name}" else info.name) },
+                            onClick = {
+                                roomMapMenu = false
+                                session.switchMap(info.id)
+                            }
+                        )
+                    }
+                }
+            }
+            Button(onClick = { showAddMapChooser = true },
+                enabled = !loadingMap && state.roomMaps.size < LAN_MAX_ROOM_MAPS) {
+                Text(if (loadingMap) "Загрузка..." else "＋ Карта")
+            }
+            OutlinedButton(
+                enabled = state.activeMapId.isNotBlank(),
+                onClick = {
+                    mapForRoomRemoval = state.roomMaps.firstOrNull { it.id == state.activeMapId }
+                }
+            ) { Text("− Удалить") }
+        } else {
+            Text("🗺 ${state.mapName.ifBlank { "Нет карты" }}", fontSize = 13.sp)
+        }
+    }
+
+    if (fullscreen && state.connected && bitmap != null && page == "map" &&
+        !showAddMapChooser && mapBeingAdded == null && mapError == null) {
         androidx.compose.ui.window.Dialog(
             onDismissRequest = { fullscreen = false },
             properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
@@ -572,6 +812,7 @@ fun LanGameScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text("Метки", fontWeight = FontWeight.Bold)
+                    roomMapControls()
                     if (isMaster) {
                         TextButton(onClick = { showPermissions = true }) { Text("⚙ Права") }
                         TextButton(onClick = { showLogs = true }) { Text("☷ Логи") }
@@ -602,7 +843,7 @@ fun LanGameScreen(
         }
     }
 
-    if (!isMaster && state.connected && bitmap != null && page != "map") {
+    if (!isMaster && state.connected && page != "map") {
         Column(Modifier.fillMaxSize().padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Сетевая игра", Modifier.weight(1f), fontSize = 22.sp, fontWeight = FontWeight.Bold)
@@ -613,6 +854,8 @@ fun LanGameScreen(
                 if (!isMaster) {
                     FilterChip(selected = page == "game", onClick = { page = "game" }, label = { Text("Персонаж") })
                     FilterChip(selected = page == "abilities", onClick = { page = "abilities" }, label = { Text("Способности") })
+                    if (state.permissions.skillTreeEnabled) FilterChip(
+                        selected = page == "talents", onClick = { page = "talents" }, label = { Text("Древо") })
                 }
             }
             if (page == "game" && activeCharacter != null) {
@@ -625,22 +868,25 @@ fun LanGameScreen(
                 if (activeCharacter != null) {
                     if (page == "game") {
                         key(masterEditRevision, activeCharacter.id) {
-                            GameScreen(
-                                character = activeCharacter,
-                                onBack = { page = "map" },
-                                onAbilities = { page = "abilities" },
-                                onMaps = { page = "map" },
-                                showNavigation = false,
-                                onEvent = { session.sendEvent(it) }
-                            )
+                        GameScreen(
+                            character = activeCharacter,
+                            onBack = { page = "map" },
+                            onAbilities = { page = "abilities" },
+                            onMaps = { page = "map" },
+                            showNavigation = false,
+                            onEvent = { session.sendEvent(it) }
+                        )
                         }
+                    } else if (page == "talents" && state.permissions.skillTreeEnabled) {
+                        SkillTreeScreen(character = activeCharacter, onBack = { page = "game" },
+                            onUpdated = { session.sendEvent("Изучил навык древа") })
                     } else {
                         key(masterEditRevision, activeCharacter.id) {
-                            AbilitiesScreen(
-                                character = activeCharacter,
-                                onBack = { page = "game" },
-                                onEvent = { session.sendEvent(it) }
-                            )
+                        AbilitiesScreen(
+                            character = activeCharacter,
+                            onBack = { page = "game" },
+                            onEvent = { session.sendEvent(it) }
+                        )
                         }
                     }
                 } else {
@@ -679,37 +925,38 @@ fun LanGameScreen(
                         }
                     }
                 }
-                Button(
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = selectedMapId != null,
-                    onClick = {
-                        val map = maps.firstOrNull { it.id == selectedMapId } ?: return@Button
-                        val roomName = "Мастер"
-                        started = true
-                        scope.launch {
-                            try {
-                                val bytes = withContext(Dispatchers.IO) {
-                                    context.contentResolver.openInputStream(Uri.parse(map.imageUri))?.use { stream ->
-                                        val output = java.io.ByteArrayOutputStream()
-                                        val buffer = ByteArray(8192)
-                                        while (output.size() <= LAN_MAX_IMAGE) {
-                                            val count = stream.read(buffer)
-                                            if (count < 0) break
-                                            output.write(buffer, 0, count)
-                                        }
-                                        output.toByteArray()
-                                    } ?: error("Не удалось открыть изображение")
-                                }
-                                if (bytes.size > LAN_MAX_IMAGE) error("Карта больше 4 МБ. Выбери изображение поменьше.")
-                                session.host(roomName, map.name, bytes)
-                            } catch (e: Exception) {
-                                state = state.copy(status = "Ошибка карты: ${e.message}")
-                                started = false
+                OutlinedButton(onClick = { imagePicker.launch(arrayOf("image/*")) },
+                    modifier = Modifier.fillMaxWidth()) { Text("＋ Загрузить новую карту") }
+                if (characters.isNotEmpty()) {
+                    var sourceMenu by remember { mutableStateOf(false) }
+                    Text("Откуда взять метки этой карты:", fontSize = 13.sp)
+                    Box {
+                        OutlinedButton(onClick = { sourceMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                            Text(characters.firstOrNull { it.id == selectedCharacterId }?.name ?: "Без переноса меток")
+                        }
+                        DropdownMenu(expanded = sourceMenu, onDismissRequest = { sourceMenu = false }) {
+                            DropdownMenuItem(text = { Text("Без переноса меток") }, onClick = {
+                                selectedCharacterId = null
+                                sourceMenu = false
+                            })
+                            characters.forEach { character ->
+                                DropdownMenuItem(text = { Text(character.name) }, onClick = {
+                                    selectedCharacterId = character.id
+                                    sourceMenu = false
+                                })
                             }
                         }
                     }
-                ) { Text("Создать комнату") }
-                if (maps.isEmpty()) Text("Сначала добавь изображение в библиотеку карт через обычный режим игры.")
+                }
+                Button(
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = selectedMapId != null && !loadingMap,
+                    onClick = {
+                        val map = maps.firstOrNull { it.id == selectedMapId } ?: return@Button
+                        uploadRoomMap(map, true)
+                    }
+                ) { Text(if (loadingMap) "Подготовка карты..." else "Создать комнату") }
+                if (maps.isEmpty()) Text("Добавь изображение прямо здесь — общая библиотека тоже пополнится.")
 
             } else {
                 Text("Персонаж участника")
@@ -756,7 +1003,7 @@ fun LanGameScreen(
         if (!state.connected && started) {
             Text(state.status, color = MaterialTheme.colorScheme.error)
         }
-        if (state.connected && bitmap != null) {
+        if (state.connected) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = page == "map", onClick = { page = "map" }, label = { Text("Общая карта") })
                 FilterChip(selected = page == "game", onClick = { page = "game" }, label = { Text("Персонаж") })
@@ -766,29 +1013,31 @@ fun LanGameScreen(
                 OutlinedButton(onClick = { showPermissions = true }) { Text("⚙ Права") }
                 OutlinedButton(onClick = { showLogs = true }) { Text("☷ Журнал") }
             }
-            Text("Карта: ${state.mapName}", fontWeight = FontWeight.SemiBold)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { fullscreen = true }) { Text("⛶ На весь экран") }
-                if (canCreateMarker) Button(onClick = { addingMarker = !addingMarker }) {
-                    Text(if (addingMarker) "Отмена" else "＋ Метка")
+            Text("Карта: ${state.mapName.ifBlank { "не выбрана" }}", fontWeight = FontWeight.SemiBold)
+            roomMapControls()
+            if (bitmap != null) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { fullscreen = true }) { Text("⛶ На весь экран") }
+                    if (canCreateMarker) Button(onClick = { addingMarker = !addingMarker }) {
+                        Text(if (addingMarker) "Отмена" else "＋ Метка")
+                    }
                 }
-            }
-            if (addingMarker) Text("Выбери место на карте для новой метки.")
-            mapContent()
-            moveControl()
-            Text("Игроков: ${state.players.size} · Меток: ${state.markers.size}")
-            state.players.forEach { player ->
-                Text("${if (player.id == state.myId) "●" else "○"} ${player.name}")
-            }
-            if (state.markers.isNotEmpty()) {
-                Text("Отметки", fontWeight = FontWeight.Bold)
-                state.markers.forEach { marker ->
-                    Text("${markerIcon(marker.type)} ${marker.name}", Modifier.clickable { selectedMarker = marker })
+                if (addingMarker) Text("Выбери место на карте для новой метки.")
+                mapContent()
+                moveControl()
+                Text("Игроков: ${state.players.size} · Меток: ${state.markers.size}")
+                state.players.forEach { player ->
+                    Text("${if (player.id == state.myId) "●" else "○"} ${player.name}")
                 }
+                if (state.markers.isNotEmpty()) {
+                    Text("Отметки", fontWeight = FontWeight.Bold)
+                    state.markers.forEach { marker ->
+                        Text("${markerIcon(marker.type)} ${marker.name}", Modifier.clickable { selectedMarker = marker })
+                    }
+                }
+            } else {
+                Text("В комнате пока нет карты. Мастер может загрузить следующую.")
             }
-        } else if (started && state.connected) {
-            CircularProgressIndicator()
-            Text("Ожидаем карту...")
         }
         OutlinedButton(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("← В главное меню") }
         if (started) {
@@ -797,13 +1046,4 @@ fun LanGameScreen(
     }
 }
 
-private fun markerIcon(type: String): String = when (type) {
-    "Сундук" -> "📦"
-    "Враг" -> "⚔"
-    "NPC" -> "👤"
-    "Задание" -> "📜"
-    "Босс" -> "💀"
-    "Опасность" -> "⚠"
-    "Другое" -> "◆"
-    else -> "📍"
-}
+private fun markerIcon(type: String): String = RpgCatalog.markerIcon(type)
