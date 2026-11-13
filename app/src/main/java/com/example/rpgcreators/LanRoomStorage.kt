@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import java.io.File
 import java.io.ByteArrayOutputStream
 import java.util.UUID
+import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -51,6 +52,16 @@ internal object LanRoomStorage {
         }
         context.getSharedPreferences("rpg_lan_cache", Context.MODE_PRIVATE).edit()
             .putString("markers_${cachedMapId(roomId, mapId)}", array.toString()).apply()
+    }
+
+    /** Stable across recreated rooms: the same image and name get the same LAN map ID.
+     * Different masters still have separate copies because cachedMapId uses roomId. */
+    fun stableRoomMapKey(name: String, bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        digest.update(name.trim().lowercase(java.util.Locale.ROOT).toByteArray(Charsets.UTF_8))
+        digest.update(0)
+        digest.update(bytes)
+        return "map-" + digest.digest().take(16).joinToString("") { "%02x".format(it) }
     }
 
     fun cachedMapId(roomId: String, roomMapId: String): Long =

@@ -16,6 +16,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -37,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -1961,6 +1963,9 @@ fun MapDetailsScreen(
         }
     }
 
+    val offlineFog = remember(map.id) { LanWorldStorage.loadOfflineFog(context, map.id) }
+    val offlineRestricted = offlineFog.enabled
+
     val markers = remember(character.id, map.id) {
         mutableStateListOf<MapMarker>().apply {
             addAll(CharacterStorage.loadCharacterMapMarkers(context, character.id, map.id))
@@ -2040,15 +2045,26 @@ fun MapDetailsScreen(
                 "Отметки персонажа: ${character.name}",
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Text("Открой карту на весь экран, чтобы удобно расставлять отметки.", fontSize = 13.sp)
+            Text(if (offlineRestricted) "Сетевая карта: скрытые участки доступны только после открытия мастером."
+                else "Открой карту на весь экран, чтобы удобно расставлять отметки.", fontSize = 13.sp)
 
             if (bitmap != null) {
-                Image(
-                    bitmap = bitmap!!,
-                    contentDescription = "Карта ${map.name}",
-                    modifier = Modifier.fillMaxWidth().heightIn(max = 360.dp),
-                    contentScale = ContentScale.Fit
-                )
+                val ratio = bitmap!!.width.toFloat() / bitmap!!.height.coerceAtLeast(1)
+                Box(Modifier.fillMaxWidth().heightIn(max = 360.dp), contentAlignment = Alignment.Center) {
+                    BoxWithConstraints(Modifier.fillMaxWidth().aspectRatio(ratio)) {
+                        Image(bitmap = bitmap!!, contentDescription = "Карта ${map.name}",
+                            modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
+                        if (offlineRestricted) Canvas(Modifier.fillMaxSize()) {
+                            val tileW = size.width / 48f
+                            val tileH = size.height / 32f
+                            for (row in 0 until 32) for (col in 0 until 48) {
+                                if (offlineFog.revealed.getOrNull(row * 48 + col) != '1')
+                                    drawRect(Color(0xF700030A), Offset(col * tileW, row * tileH),
+                                        androidx.compose.ui.geometry.Size(tileW + .35f, tileH + .35f))
+                            }
+                        }
+                    }
+                }
             } else {
                 Text("Не удалось загрузить изображение карты")
             }
@@ -2057,7 +2073,7 @@ fun MapDetailsScreen(
             if (markers.isEmpty()) {
                 Text("На этой карте у персонажа пока нет отметок.")
             } else {
-                markers.forEachIndexed { index, marker ->
+                markers.filter { offlineFog.visible(it.x, it.y) }.forEachIndexed { index, marker ->
                     Card(Modifier.fillMaxWidth().clickable { selectedMarker = marker }) {
                         Column(Modifier.padding(12.dp)) {
                             Text("${RpgCatalog.markerIcon(marker.type)}  ${index + 1}. ${marker.name}", fontWeight = FontWeight.SemiBold)
@@ -2111,7 +2127,7 @@ fun MapDetailsScreen(
                     contentScale = ContentScale.Fit
                 )
 
-                markers.forEachIndexed { index, marker ->
+                markers.filter { offlineFog.visible(it.x, it.y) }.forEachIndexed { index, marker ->
                     val markerEmoji = RpgCatalog.markerIcon(marker.type)
                     Box(
                         Modifier
@@ -2130,6 +2146,18 @@ fun MapDetailsScreen(
                             markerEmoji,
                             fontSize = 17.sp
                         )
+                    }
+                }
+                if (offlineRestricted) {
+                    Canvas(Modifier.align(Alignment.Center).width(fittedWidth).height(fittedHeight)) {
+                        val tileW = size.width / 48f
+                        val tileH = size.height / 32f
+                        for (row in 0 until 32) for (col in 0 until 48) {
+                            if (offlineFog.revealed.getOrNull(row * 48 + col) != '1') {
+                                drawRect(Color(0xF700030A), topLeft = Offset(col * tileW, row * tileH),
+                                    size = androidx.compose.ui.geometry.Size(tileW + .35f, tileH + .35f))
+                            }
+                        }
                     }
                 }
             } else {
@@ -2187,7 +2215,7 @@ fun MapDetailsScreen(
             }
 
             // Боковая панель управления перемещением: не перекрывает игровую карту.
-            if (markerToMoveId != null && bitmap != null) {
+            if (!offlineRestricted && markerToMoveId != null && bitmap != null) {
                 val joystickRatio = bitmap!!.width.toFloat() / bitmap!!.height.toFloat()
                 val joystickWidth = if (maxWidth / joystickRatio <= maxHeight) maxWidth else maxHeight * joystickRatio
                 val joystickHeight = joystickWidth / joystickRatio
@@ -2269,7 +2297,7 @@ fun MapDetailsScreen(
 
             // Компактная панель вместо широкой сетки FilterChip, вылезавшей за экран.
             // В альбомной ориентации видны кнопка каталога и небольшой прокручиваемый список.
-            Column(
+            if (!offlineRestricted) Column(
                 Modifier.align(Alignment.BottomStart).padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 horizontalAlignment = Alignment.Start

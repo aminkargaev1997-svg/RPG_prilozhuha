@@ -70,11 +70,11 @@ fun RpgCatalogPickerDialog(
         val term = query.trim()
         entries.filter { entry ->
             (group == "Все" || entry.group == group) &&
-                    (genre == "Все жанры" || entry.genre == genre) &&
-                    (term.isEmpty() || entry.name.contains(term, ignoreCase = true) ||
-                            entry.description.contains(term, ignoreCase = true) ||
-                            entry.group.contains(term, ignoreCase = true) ||
-                            entry.genre.contains(term, ignoreCase = true))
+                (genre == "Все жанры" || entry.genre == genre) &&
+                (term.isEmpty() || entry.name.contains(term, ignoreCase = true) ||
+                    entry.description.contains(term, ignoreCase = true) ||
+                    entry.group.contains(term, ignoreCase = true) ||
+                    entry.genre.contains(term, ignoreCase = true))
         }
     }
 
@@ -233,9 +233,9 @@ fun RpgCatalogPickerDialog(
 @Composable
 private fun CatalogGroupItem(name: String, selected: Boolean, onClick: () -> Unit) {
     val background = if (selected) MaterialTheme.colorScheme.secondaryContainer
-    else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.38f)
+                     else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.38f)
     val textColor = if (selected) MaterialTheme.colorScheme.onSecondaryContainer
-    else MaterialTheme.colorScheme.onSurface
+                    else MaterialTheme.colorScheme.onSurface
     Box(
         modifier = Modifier.fillMaxWidth().background(background, RoundedCornerShape(9.dp))
             .clickable(onClick = onClick).padding(horizontal = 9.dp, vertical = 8.dp)

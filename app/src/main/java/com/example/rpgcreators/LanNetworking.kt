@@ -40,6 +40,8 @@ internal data class LanLog(val time: Long, val actor: String, val action: String
 internal const val LAN_MAX_ROOM_MAPS = 12
 internal data class LanRoomMapInfo(val id: String, val name: String, val localMapId: Long)
 internal data class LanState(
+    val fog: LanFog = LanFog(),
+    val conversation: LanConversation? = null,
     val connected: Boolean = false,
     val status: String = "Не подключено",
     val myId: String = "",
@@ -55,6 +57,14 @@ internal data class LanState(
     val logs: List<LanLog> = emptyList(),
     val characterSnapshots: List<LanCharacterSnapshot> = emptyList()
 )
+
+// Trial interaction range in normalized map coordinates. Independent of zoom and screen pixels.
+internal const val LAN_INTERACTION_RADIUS = 0.085f
+internal fun lanMarkerInRange(player: LanPlayer, marker: LanMarker): Boolean {
+    val dx = player.x - marker.x
+    val dy = player.y - marker.y
+    return dx * dx + dy * dy <= LAN_INTERACTION_RADIUS * LAN_INTERACTION_RADIUS
+}
 
 internal data class LanMarker(
     val id: String,
@@ -153,6 +163,8 @@ internal class LanSession(
     private val roomMaps = linkedMapOf<String, RoomMap>()
     private val markerSets = linkedMapOf<String, LinkedHashMap<String, LanMarker>>()
     private val positions = linkedMapOf<String, MutableMap<String, Pair<Float, Float>>>()
+    private val fogByMap = linkedMapOf<String, LanFog>()
+    private var conversation: LanConversation? = null
     private val markers: LinkedHashMap<String, LanMarker>
         get() = markerSets.getOrPut(activeMapId) { linkedMapOf() }
     private val roomId = LanRoomStorage.masterRoomId(appContext)
@@ -193,6 +205,7 @@ internal class LanSession(
                 catch (_: Exception) { return false }
             map = RoomMap(LanRoomMapInfo(id, name.take(80), localId), bytes)
             roomMaps[id] = map
+            fogByMap[id] = LanWorldStorage.loadFog(appContext, roomId, id)
             val saved = LanRoomStorage.loadRoomMarkers(appContext, roomId, id)
             markerSets[id] = linkedMapOf<String, LanMarker>().apply {
                 (saved ?: initialMarkers).forEach { marker ->
@@ -208,11 +221,13 @@ internal class LanSession(
         val packet = mapPacket(map)
         val selectedPacket = JSONObject().put("type", "map_select").put("id", id).toString()
         val selectedMarkers = markersMessage(id)
+        val selectedFog = fogPacket(id)
         broadcast.execute {
             peers.forEach { peer -> try {
                 peer.send(packet)
                 peer.send(selectedPacket)
                 peer.send(selectedMarkers)
+                peer.send(selectedFog)
             } catch (_: Exception) {} }
             publishPlayers()
         }
@@ -227,6 +242,7 @@ internal class LanSession(
             target = roomMaps[id] ?: return false
             if (activeMapId == id) return true
             activeMapId = id
+            conversation = null
             players.keys.toList().forEach { playerId ->
                 val player = players[playerId] ?: return@forEach
                 val location = positions[id]?.get(playerId) ?: (0.5f to 0.5f)
@@ -236,14 +252,16 @@ internal class LanSession(
                 mapName = target.info.name, image = target.bytes,
                 roomMaps = roomMaps.values.map { map -> map.info },
                 roomMarkers = markerSnapshots(), markers = markers.values.toList(),
-                players = players.values.toList()) }
+                players = players.values.toList(), fog = fogByMap[id] ?: LanFog(), conversation = null) }
         }
         log("Мастер", "Открыл карту «${target.info.name}»")
         if (broadcastChange) {
             val selection = JSONObject().put("type", "map_select").put("id", id).toString()
+            val closedDialog = conversationPacket(null)
             val markerData = markersMessage(id)
+            val fogData = fogPacket(id)
             broadcast.execute {
-            peers.forEach { peer -> try { peer.send(selection); peer.send(markerData) } catch (_: Exception) {} }
+            peers.forEach { peer -> try { peer.send(selection); peer.send(markerData); peer.send(fogData); peer.send(closedDialog) } catch (_: Exception) {} }
             publishPlayers()
             }
         }
@@ -260,6 +278,7 @@ internal class LanSession(
             val removed = roomMaps.remove(id) ?: return false
             removedName = removed.info.name
             markerSets.remove(id)
+            fogByMap.remove(id)
             positions.remove(id)
             if (activeMapId == id) {
                 activeMapId = roomMaps.keys.firstOrNull().orEmpty()
@@ -279,6 +298,7 @@ internal class LanSession(
                 roomMaps = roomMaps.values.map { map -> map.info },
                 roomMarkers = markerSnapshots(),
                 markers = currentMarkers,
+                fog = fogByMap[nextId] ?: LanFog(),
                 players = players.values.toList()
             ) }
         }
@@ -508,19 +528,21 @@ internal class LanSession(
                     activeMapId = mapId
                     roomMaps[mapId] = RoomMap(LanRoomMapInfo(mapId, mapName.take(80), localId), bytes)
                     val saved = LanRoomStorage.loadRoomMarkers(appContext, roomId, mapId)
+                    fogByMap[mapId] = LanWorldStorage.loadFog(appContext, roomId, mapId)
                     markerSets[mapId] = linkedMapOf<String, LanMarker>().apply {
                         (saved ?: initialMarkers).forEach { marker ->
                             if (marker.id.isNotBlank()) put(marker.id, marker.copy(ownerId = "host"))
                         }
                     }
-                    players[id] = LanPlayer(id, name, 0.5f, 0.5f)
+                    // The host moderates the room; it is not a player marker.
                 }
                 LanRoomStorage.saveRoomMarkers(appContext, roomId, mapId,
                     synchronized(lock) { markers.values.toList() })
                 update { it.copy(connected = true, status = "Комната создана. TCP-сервер слушает порт $LAN_PORT",
                     myId = id, mapName = mapName, image = bytes, activeMapId = mapId, roomId = roomId,
                     roomMaps = roomMaps.values.map { map -> map.info }, roomMarkers = markerSnapshots(),
-                    markers = markers.values.toList(), players = players.values.toList(), permissions = permissions) }
+                    markers = markers.values.toList(), players = players.values.toList(), permissions = permissions,
+                    fog = fogByMap[mapId] ?: LanFog()) }
                 log("Мастер", "Создал комнату: $mapName")
                 while (!closed) {
                     val socket = try { listening.accept() } catch (_: Exception) { break }
@@ -541,7 +563,10 @@ internal class LanSession(
                             // Send every known map and its markers, then select the active one.
                             val existingMaps = synchronized(lock) { roomMaps.values.toList() }
                             existingMaps.forEach { roomMap -> connectedPeer.send(mapPacket(roomMap)) }
-                            existingMaps.forEach { roomMap -> connectedPeer.send(markersMessage(roomMap.info.id)) }
+                            existingMaps.forEach { roomMap ->
+                                connectedPeer.send(markersMessage(roomMap.info.id))
+                                connectedPeer.send(fogPacket(roomMap.info.id))
+                            }
                             synchronized(lock) {
                                 // Reconcile changes made while the initial image set was sent.
                                 val alreadySent = existingMaps.mapTo(hashSetOf()) { it.info.id }
@@ -552,10 +577,12 @@ internal class LanSession(
                                 roomMaps.values.filter { it.info.id !in alreadySent }.forEach { roomMap ->
                                     connectedPeer.send(mapPacket(roomMap))
                                     connectedPeer.send(markersMessage(roomMap.info.id))
+                                    connectedPeer.send(fogPacket(roomMap.info.id))
                                 }
                                 connectedPeer.send(mapSelectionPacket())
                                 connectedPeer.send(JSONObject().put("type", "welcome").put("id", idClient).toString())
                                 connectedPeer.send(permissionMessage())
+                                conversation?.let { connectedPeer.send(conversationPacketForPeer(it, idClient)) }
                                 players[idClient] = LanPlayer(idClient, nameClient, 0.5f, 0.5f)
                                 peers.add(connectedPeer)
                             }
@@ -571,6 +598,9 @@ internal class LanSession(
                                 }
                                 if (action == "character_snapshot") {
                                     receiveCharacterSnapshot(idClient, nameClient, message.optString("payload"))
+                                }
+                                if (action == "dialog_command") {
+                                    handleDialogCommand(idClient, message)
                                 }
                                 if (action == "event") {
                                     log(nameClient, message.optString("action").take(160))
@@ -593,6 +623,8 @@ internal class LanSession(
                                         synchronized(lock) {
                                             val old = players[idClient]
                                             if (old != null) {
+                                                val fog = fogByMap[activeMapId] ?: LanFog()
+                                                if (!fog.allowedPath(old.x, old.y, x.toFloat(), y.toFloat())) return@synchronized
                                                 val pos = x.toFloat().coerceIn(0f, 1f) to y.toFloat().coerceIn(0f, 1f)
                                                 players[idClient] = old.copy(x = pos.first, y = pos.second)
                                                 positions.getOrPut(activeMapId) { linkedMapOf() }[idClient] = pos
@@ -608,9 +640,17 @@ internal class LanSession(
                                 synchronized(lock) {
                                     peers.remove(it); players.remove(it.id); snapshots.remove(it.id)
                                     pendingEdits.entries.removeAll { entry -> entry.value.first == it.id }
+                                    conversation?.let { active ->
+                                        if (it.id in active.participants) {
+                                            conversation = active.copy(
+                                                participants = active.participants - it.id,
+                                                speakerId = if (active.speakerId == it.id) "" else active.speakerId)
+                                        }
+                                    }
                                 }
                                 update { old -> old.copy(characterSnapshots = synchronized(lock) { snapshots.map { (id, data) -> LanCharacterSnapshot(id, data) } }) }
                                 publishPlayers()
+                                broadcastConversation()
                                 log(nameClient, "Отключился")
                             }
                             try { socket.close() } catch (_: Exception) {}
@@ -651,7 +691,10 @@ internal class LanSession(
                             val name = message.optString("name").take(80)
                             if (id.isBlank() || remoteRoomId.isBlank()) continue
                             val localId = LanRoomStorage.saveMap(appContext, remoteRoomId, id, name, bytes)
-                            synchronized(lock) { roomMaps[id] = RoomMap(LanRoomMapInfo(id, name, localId), bytes) }
+                            synchronized(lock) {
+                                roomMaps[id] = RoomMap(LanRoomMapInfo(id, name, localId), bytes)
+                                fogByMap[id] = LanWorldStorage.loadFog(appContext, remoteRoomId, id)
+                            }
                             update { it.copy(roomId = remoteRoomId,
                                 roomMaps = synchronized(lock) { roomMaps.values.map { map -> map.info } }) }
                         }
@@ -664,6 +707,7 @@ internal class LanSession(
                             synchronized(lock) {
                                 roomMaps.remove(removedId)
                                 markerSets.remove(removedId)
+                                fogByMap.remove(removedId)
                                 positions.remove(removedId)
                                 nextId = if (requestedId in roomMaps) requestedId
                                     else if (activeMapId != removedId && activeMapId in roomMaps) activeMapId
@@ -678,7 +722,7 @@ internal class LanSession(
                                 image = nextMap?.bytes,
                                 roomMaps = synchronized(lock) { roomMaps.values.map { map -> map.info } },
                                 roomMarkers = synchronized(lock) { markerSnapshots() },
-                                markers = nextMarkers
+                                markers = nextMarkers, fog = synchronized(lock) { fogByMap[nextId] ?: LanFog() }
                             ) }
                         }
                         "map_select" -> {
@@ -688,7 +732,30 @@ internal class LanSession(
                             } ?: continue
                             update { it.copy(activeMapId = id, mapName = target.info.name,
                                 image = target.bytes, markers = synchronized(lock) { markers.values.toList() },
-                                roomMarkers = synchronized(lock) { markerSnapshots() }) }
+                                roomMarkers = synchronized(lock) { markerSnapshots() },
+                                fog = synchronized(lock) { fogByMap[id] ?: LanFog() }, conversation = null) }
+                        }
+                        "fog" -> {
+                            val id = message.optString("mapId")
+                            val raw = message.optString("revealed")
+                            if (id.isNotBlank() && raw.length == 48 * 32 && raw.all { it == '0' || it == '1' }) {
+                                val newFog = LanFog(message.optBoolean("enabled"), raw)
+                                synchronized(lock) { fogByMap[id] = newFog }
+                                LanWorldStorage.saveFog(appContext, state.roomId, id, newFog)
+                                update { old -> if (old.activeMapId == id) old.copy(fog = newFog) else old }
+                            }
+                        }
+                        "conversation" -> {
+                            val participants = message.optJSONArray("participants") ?: JSONArray()
+                            val current = if (message.optBoolean("active")) LanConversation(
+                                message.optString("markerId"), message.optString("markerName"),
+                                (0 until participants.length()).map { participants.optString(it) },
+                                message.optString("speaker"), message.optBoolean("global"),
+                                message.optString("line"),
+                                (message.optJSONArray("history") ?: JSONArray()).let { values ->
+                                    (0 until values.length().coerceAtMost(40)).map { values.optString(it).take(1000) }
+                                }) else null
+                            update { it.copy(conversation = current) }
                         }
                         "welcome" -> update { it.copy(myId = message.optString("id")) }
                         "master_edit" -> receiveMasterEdit(message)
@@ -789,11 +856,15 @@ internal class LanSession(
                         (senderId == "host" || permissions.createMarkers)
                     else old != null && (senderId == "host" ||
                         (old.ownerId == senderId && permissions.moveOwnMarkers))
-                    if (allowed && id.isNotBlank() && name.isNotBlank() && x.isFinite() && y.isFinite()) {
+                    val markerType = message.optString("markerType", "Обычная").take(40)
+                    val specialAllowed = senderId == "host" ||
+                        (markerType !in setOf("NPC", "Толпа", "Записка") &&
+                            old?.type !in setOf("NPC", "Толпа", "Записка"))
+                    if (allowed && specialAllowed && id.isNotBlank() && name.isNotBlank() && x.isFinite() && y.isFinite()) {
                         val owner = old?.ownerId ?: senderId
                         markers[id] = LanMarker(id, name,
-                            message.optString("description").take(300),
-                            message.optString("markerType", "Обычная").take(40),
+                            message.optString("description").take(1000),
+                            markerType,
                             x.toFloat().coerceIn(0f, 1f), y.toFloat().coerceIn(0f, 1f), owner)
                         accepted = true
                         if (action == "marker_add") event = "Создал метку «$name»"
@@ -885,13 +956,7 @@ internal class LanSession(
         val px = x.coerceIn(0f, 1f)
         val py = y.coerceIn(0f, 1f)
         if (hostMode) {
-            synchronized(lock) {
-                val old = players["host"] ?: return
-                players["host"] = old.copy(x = px, y = py)
-                positions.getOrPut(activeMapId) { linkedMapOf() }["host"] = px to py
-            }
-            update { it.copy(players = synchronized(lock) { players.values.toList() }) }
-            broadcast.execute { if (!closed) publishPlayers() }
+            return // Only connected guests have player positions.
         } else {
             val writer = outgoing ?: return
             update { current ->
@@ -909,6 +974,134 @@ internal class LanSession(
                 } catch (_: Exception) {}
             }
         }
+    }
+
+    private fun fogPacket(id: String): String {
+        val fog = synchronized(lock) { fogByMap[id] ?: LanFog() }
+        return JSONObject().put("type", "fog").put("mapId", id)
+            .put("enabled", fog.enabled).put("revealed", fog.revealed).toString()
+    }
+
+    /** Host-only fog edits. Clients receive the authoritative mask. */
+    fun setFogEnabled(enabled: Boolean) {
+        if (!hostMode || activeMapId.isBlank()) return
+        val fog = synchronized(lock) { fogByMap[activeMapId] ?: LanFog() }
+        publishFog(fog.copy(enabled = enabled))
+    }
+
+    fun brushFog(x: Float, y: Float, erase: Boolean) {
+        if (!hostMode || activeMapId.isBlank()) return
+        val fog = synchronized(lock) { fogByMap[activeMapId] ?: LanFog() }
+        publishFog(fog.brush(x, y, erase))
+    }
+
+    private fun publishFog(fog: LanFog) {
+        val id = synchronized(lock) {
+            fogByMap[activeMapId] = fog
+            activeMapId
+        }
+        LanWorldStorage.saveFog(appContext, roomId, id, fog)
+        update { it.copy(fog = fog) }
+        val packet = fogPacket(id)
+        broadcast.execute { peers.forEach { peer -> try { peer.send(packet) } catch (_: Exception) {} } }
+    }
+
+    private fun conversationPacket(value: LanConversation?): String = JSONObject().apply {
+        put("type", "conversation")
+        put("active", value != null)
+        if (value != null) {
+            put("markerId", value.markerId)
+            put("markerName", value.markerName)
+            put("participants", JSONArray(value.participants))
+            put("speaker", value.speakerId)
+            put("global", value.global)
+            put("line", value.masterLine)
+            put("history", JSONArray(value.history))
+        }
+    }.toString()
+
+    private fun conversationPacketForPeer(value: LanConversation?, peerId: String): String {
+        if (value == null || peerId in value.participants) return conversationPacket(value)
+        // An observer learns that someone is speaking with this NPC, but receives no dialogue content.
+        return conversationPacket(value.copy(participants = emptyList(), speakerId = "",
+            masterLine = "", history = emptyList()))
+    }
+
+    private fun broadcastConversation() {
+        val snapshot = synchronized(lock) { conversation }
+        update { it.copy(conversation = snapshot) }
+        broadcast.execute {
+            peers.forEach { peer -> try { peer.send(conversationPacketForPeer(snapshot, peer.id)) }
+                catch (_: Exception) {} }
+        }
+    }
+
+    /** Players request to join; host validates everything and owns the speaking lock. */
+    fun dialogCommand(action: String, markerId: String = "", line: String = "") {
+        val data = JSONObject().put("type", "dialog_command").put("action", action)
+            .put("markerId", markerId).put("line", line.take(1000))
+        if (hostMode) handleDialogCommand("host", data)
+        else {
+            val writer = outgoing ?: return
+            outbound.execute { try { synchronized(writer) {
+                writer.write(data.toString()); writer.newLine(); writer.flush()
+            } } catch (_: Exception) {} }
+        }
+    }
+
+    private fun handleDialogCommand(actorId: String, message: JSONObject) {
+        if (!hostMode) return
+        val action = message.optString("action")
+        synchronized(lock) {
+            val current = conversation
+            when (action) {
+                "open", "global" -> {
+                    val markerId = message.optString("markerId")
+                    val marker = markers[markerId] ?: return
+                    if (marker.type != "NPC" && marker.type != "Толпа") return
+                    if (actorId != "host") {
+                        if (!(fogByMap[activeMapId] ?: LanFog()).visible(marker.x, marker.y)) return
+                        val player = players[actorId] ?: return
+                        if (!lanMarkerInRange(player, marker)) return
+                    }
+                    if (action == "global" && actorId != "host") return
+                    if (current != null && current.markerId != markerId) return
+                    val allPlayers = if (action == "global") players.keys.toList()
+                        else ((current?.participants ?: emptyList()) + actorId + "host").distinct()
+                    conversation = LanConversation(markerId, marker.name, allPlayers,
+                        current?.speakerId ?: "", action == "global" || current?.global == true,
+                        current?.masterLine ?: marker.description,
+                        current?.history ?: emptyList())
+                }
+                "join" -> if (current != null && current.markerId == message.optString("markerId") && actorId in players) {
+                    val marker = markers[current.markerId] ?: return
+                    val player = players[actorId] ?: return
+                    if (!(fogByMap[activeMapId] ?: LanFog()).visible(marker.x, marker.y)) return
+                    if (!lanMarkerInRange(player, marker)) return
+                    conversation = current.copy(participants = (current.participants + actorId).distinct())
+                }
+                "leave" -> if (current != null && actorId in current.participants) {
+                    val remaining = current.participants - actorId
+                    conversation = if (remaining.none { it != "host" } && !current.global) null
+                        else current.copy(participants = remaining,
+                            speakerId = if (current.speakerId == actorId) "" else current.speakerId)
+                }
+                "speak" -> if (current != null && actorId in current.participants && current.speakerId.isBlank()) {
+                    conversation = current.copy(speakerId = actorId)
+                }
+                "release" -> if (current != null && (actorId == current.speakerId || actorId == "host")) {
+                    conversation = current.copy(speakerId = "")
+                }
+                "line" -> if (current != null && actorId == "host") {
+                    val line = message.optString("line").take(1000)
+                    if (line.isNotBlank()) conversation = current.copy(masterLine = line,
+                        history = (current.history + line).takeLast(40))
+                }
+                "close" -> if (actorId == "host") conversation = null
+                else -> return
+            }
+        }
+        broadcastConversation()
     }
 
     fun close() {
