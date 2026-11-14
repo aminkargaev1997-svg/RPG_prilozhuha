@@ -66,15 +66,33 @@ object CharacterStorage {
         }
     }
 
+    // Virtual, undeletable built-in journal. The quests themselves are stored separately.
+    fun journalItemId(characterId: Long): Long = Long.MIN_VALUE + characterId.coerceAtLeast(0L)
+    fun isJournalItem(item: InventoryItem): Boolean = item.id < 0L && item.name == "Журнал приключений"
+    private fun journalItem(characterId: Long) = InventoryItem(
+        id = journalItemId(characterId), name = "Журнал приключений",
+        category = "Квестовые", description = "Открывает журнал заданий. Не удаляется."
+    )
+
+    // Multi-use teleport scroll: two charges per game day are tracked by the host.
+    fun isTeleportScroll(item: InventoryItem): Boolean =
+        item.id < 0L && item.name == "Свиток телепортации"
+    fun isBoundItem(item: InventoryItem): Boolean = isJournalItem(item) || isTeleportScroll(item)
+    private fun teleportScroll(characterId: Long) = InventoryItem(
+        id = Long.MIN_VALUE / 2 + characterId.coerceAtLeast(0L), name = "Свиток телепортации",
+        category = "Особые", description = "Для группового перехода с расстояния. Два применения за игровой день."
+    )
+
     // ИНВЕНТАРЬ
     fun saveInventory(context: Context, characterId: Long, items: List<InventoryItem>) {
         val array = JSONArray()
-        items.forEach { item ->
+        items.filterNot(::isBoundItem).forEach { item ->
             array.put(JSONObject().apply {
                 put("id", item.id)
                 put("name", item.name)
                 put("quantity", item.quantity)
                 put("description", item.description)
+                put("category", item.category)
             })
         }
         preferences(context).edit()
@@ -84,21 +102,44 @@ object CharacterStorage {
 
     fun loadInventory(context: Context, characterId: Long): List<InventoryItem> {
         val saved = preferences(context)
-            .getString(INVENTORY_PREFIX + characterId, null) ?: return emptyList()
+            .getString(INVENTORY_PREFIX + characterId, null) ?: return listOf(journalItem(characterId), teleportScroll(characterId))
         return try {
             val array = JSONArray(saved)
-            List(array.length()) { index ->
+            listOf(journalItem(characterId), teleportScroll(characterId)) + List(array.length()) { index ->
                 val item = array.getJSONObject(index)
                 InventoryItem(
                     id = item.getLong("id"),
                     name = item.getString("name"),
                     quantity = item.optString("quantity", ""),
-                    description = item.optString("description", "")
+                    description = item.optString("description", ""),
+                    category = item.optString("category", "Прочее")
                 )
             }
         } catch (_: Exception) {
-            emptyList()
+            listOf(journalItem(characterId))
         }
+    }
+
+    /**
+     * A shop receipt and the new inventory are committed in ONE preferences
+     * transaction. Re-delivery after reconnect cannot give the same items twice.
+     */
+    fun commitShopPurchaseOnce(context: Context, characterId: Long,
+                               receiptId: String, goods: List<InventoryItem>): Boolean = synchronized(this) {
+        if (receiptId.isBlank() || goods.isEmpty() || goods.size > 100) return@synchronized false
+        if (loadCharacters(context).none { it.id == characterId }) return@synchronized false
+        val prefs = preferences(context)
+        val key = "shop_receipt_" + receiptId
+        if (prefs.getBoolean(key, false)) return@synchronized true
+        val existing = loadInventory(context, characterId).filterNot(::isBoundItem)
+        val data = JSONArray()
+        (existing + goods).forEach { item ->
+            data.put(JSONObject().put("id", item.id).put("name", item.name)
+                .put("quantity", item.quantity).put("description", item.description)
+                .put("category", item.category))
+        }
+        prefs.edit().putString(INVENTORY_PREFIX + characterId, data.toString())
+            .putBoolean(key, true).commit()
     }
 
     // ЭКИПИРОВКА
@@ -164,6 +205,7 @@ object CharacterStorage {
                 put("activatorDescription", ability.activatorDescription)
                 put("passiveDescription", ability.passiveDescription)
                 put("isUsed", ability.isUsed)
+                put("origin", ability.origin)
             })
         }
         preferences(context).edit()
@@ -194,7 +236,8 @@ object CharacterStorage {
                         "passiveDescription",
                         if (legacyPassive) "Пассивный эффект (запись из старой версии)" else ""
                     ),
-                    isUsed = item.optBoolean("isUsed", false)
+                    isUsed = item.optBoolean("isUsed", false),
+                    origin = item.optString("origin", "")
                 )
             }
         } catch (_: Exception) {
@@ -321,5 +364,6 @@ object CharacterStorage {
 
         editor.apply()
         SkillTreeStorage.clear(context, characterId)
+        RpgQuestStorage.deleteCharacter(context, characterId)
     }
 }

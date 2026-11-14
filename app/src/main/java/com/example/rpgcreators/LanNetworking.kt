@@ -28,7 +28,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 internal const val LAN_PORT = 8988
 internal const val LAN_MAX_IMAGE = 4 * 1024 * 1024
 
-internal data class LanPlayer(val id: String, val name: String, val x: Float, val y: Float)
+internal data class LanPlayer(val id: String, val name: String, val x: Float, val y: Float, val mapId: String = "")
 internal data class LanPermissions(
     val createMarkers: Boolean = false,
     val moveOwnMarkers: Boolean = true,
@@ -40,8 +40,15 @@ internal data class LanLog(val time: Long, val actor: String, val action: String
 internal const val LAN_MAX_ROOM_MAPS = 12
 internal data class LanRoomMapInfo(val id: String, val name: String, val localMapId: Long)
 internal data class LanState(
+    // While the host is moving this player, their local joystick is disabled.
+    // Empty ID means every guest may move themselves normally.
+    val masterMovingPlayerId: String = "",
+    val inventoryRevision: Int = 0,
+    val adventure: AdventureWorld = AdventureWorld(),
     val fog: LanFog = LanFog(),
     val conversation: LanConversation? = null,
+    val quests: List<RpgQuest> = emptyList(),
+    val questsVersion: Int = 0,
     val connected: Boolean = false,
     val status: String = "Не подключено",
     val myId: String = "",
@@ -159,6 +166,8 @@ internal class LanSession(
     private val broadcast = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val lock = Any()
     private val players = linkedMapOf<String, LanPlayer>()
+    // Only the host can change this lock; incoming guest moves are checked against it.
+    private var masterMovingPlayerId = ""
     private data class RoomMap(val info: LanRoomMapInfo, val bytes: ByteArray)
     private val roomMaps = linkedMapOf<String, RoomMap>()
     private val markerSets = linkedMapOf<String, LinkedHashMap<String, LanMarker>>()
@@ -168,6 +177,14 @@ internal class LanSession(
     private val markers: LinkedHashMap<String, LanMarker>
         get() = markerSets.getOrPut(activeMapId) { linkedMapOf() }
     private val roomId = LanRoomStorage.masterRoomId(appContext)
+    private var adventure = AdventureStorage.load(appContext, roomId)
+    private val openChests = mutableMapOf<String, String>()
+    private val openShops = mutableMapOf<String, String>()
+    private data class PendingDelivery(val playerId: String, val label: String,
+        val chestMarkerId: String = "", val chestItemId: String = "")
+    private val pendingDeliveries = linkedMapOf<String, PendingDelivery>()
+    private val peerNotices = mutableMapOf<String, String>()
+    private var campaignQuests = RpgQuestStorage.load(appContext, RpgQuestStorage.campaignKey(roomId))
     private var activeMapId = ""
     private var permissions = LanPermissions(skillTreeEnabled = appContext
         .getSharedPreferences("rpg_lan_cache", Context.MODE_PRIVATE)
@@ -246,7 +263,7 @@ internal class LanSession(
             players.keys.toList().forEach { playerId ->
                 val player = players[playerId] ?: return@forEach
                 val location = positions[id]?.get(playerId) ?: (0.5f to 0.5f)
-                players[playerId] = player.copy(x = location.first, y = location.second)
+                players[playerId] = player.copy(x = location.first, y = location.second, mapId = id)
             }
             update { it.copy(activeMapId = id, roomId = roomId,
                 mapName = target.info.name, image = target.bytes,
@@ -285,7 +302,7 @@ internal class LanSession(
                 players.keys.toList().forEach { playerId ->
                     val player = players[playerId] ?: return@forEach
                     val (x, y) = positions[activeMapId]?.get(playerId) ?: (0.5f to 0.5f)
-                    players[playerId] = player.copy(x = x, y = y)
+                    players[playerId] = player.copy(x = x, y = y, mapId = activeMapId)
                 }
             }
             nextId = activeMapId
@@ -365,6 +382,29 @@ internal class LanSession(
         update { it.copy(logs = synchronized(lock) { logs.toList() }) }
     }
 
+    private fun masterMovementPacket(): String = JSONObject()
+        .put("type", "master_movement")
+        .put("playerId", synchronized(lock) { masterMovingPlayerId })
+        .toString()
+
+    /** Temporarily seize one player's movement; pass null to give control back. */
+    fun setMasterMovementTarget(playerId: String?) {
+        if (!hostMode || closed) return
+        val target = playerId.orEmpty()
+        val changed = synchronized(lock) {
+            if (target.isNotEmpty() && target !in players) return@synchronized false
+            if (masterMovingPlayerId == target) return@synchronized false
+            masterMovingPlayerId = target
+            true
+        }
+        if (!changed) return
+        update { it.copy(masterMovingPlayerId = target) }
+        val packet = masterMovementPacket()
+        broadcast.execute {
+            if (!closed) peers.forEach { peer -> try { peer.send(packet) } catch (_: Exception) {} }
+        }
+    }
+
     private fun permissionMessage(): String = JSONObject().put("type", "permissions")
         .put("create", permissions.createMarkers)
         .put("moveOwn", permissions.moveOwnMarkers)
@@ -380,6 +420,25 @@ internal class LanSession(
         log("Мастер", "Изменил разрешения: создание=${value.createMarkers}, перемещение=${value.moveOwnMarkers}, удаление=${value.deleteOwnMarkers}")
         val msg = permissionMessage()
         broadcast.execute { peers.forEach { try { it.send(msg) } catch (_: Exception) {} } }
+    }
+
+    // The host owns campaign quests. Clients only receive quests for their displayed name.
+    private fun questsPacket(playerName: String): String = JSONObject()
+        .put("type", "quest_list")
+        .put("roomId", roomId)
+        .put("quests", JSONArray(RpgQuestStorage.encode(campaignQuests.filter { q ->
+            q.published && (q.recipient.isBlank() || q.recipient == playerName)
+        }))).toString()
+
+    fun setCampaignQuests(quests: List<RpgQuest>) {
+        if (!hostMode || closed) return
+        val cleaned = quests.take(200)
+        synchronized(lock) { campaignQuests = cleaned }
+        RpgQuestStorage.save(appContext, RpgQuestStorage.campaignKey(roomId), cleaned)
+        update { it.copy(quests = cleaned) }
+        broadcast.execute { peers.forEach { peer ->
+            try { peer.send(questsPacket(players[peer.id]?.name.orEmpty())) } catch (_: Exception) { }
+        } }
     }
 
     fun sendEvent(action: String) {
@@ -417,7 +476,8 @@ internal class LanSession(
     ): Boolean {
         if (!hostMode || closed || operation !in setOf(
                 "identity", "level", "grant_xp", "set_xp", "max_xp", "auto_xp", "attribute",
-                "item_save", "item_delete", "ability_save", "ability_delete", "equipment"
+                "item_save", "item_delete", "ability_save", "ability_delete", "equipment", "adventure_rest", "hero_story_pair",
+                "skill_points", "skill_reset", "skill_learn"
             )) return false
         val target: Peer
         synchronized(lock) {
@@ -489,6 +549,10 @@ internal class LanSession(
             }
         }
         if (playerRenamed) broadcast.execute { if (!closed) publishPlayers() }
+        // Re-send durable, idempotent receipts after reconnect or a lost acknowledgement.
+        val characterId = current.optLong("id", -1L)
+        synchronized(lock) { adventure.pendingShop.filter { it.characterId == characterId } }
+            .forEach { sendShopReceipt(id, it) }
         if (previous != null) {
             val fields = listOf("name" to "Имя", "race" to "Раса", "profession" to "Класс",
                 "level" to "Уровень", "experience" to "Опыт", "attributes" to "Характеристики",
@@ -542,7 +606,7 @@ internal class LanSession(
                     myId = id, mapName = mapName, image = bytes, activeMapId = mapId, roomId = roomId,
                     roomMaps = roomMaps.values.map { map -> map.info }, roomMarkers = markerSnapshots(),
                     markers = markers.values.toList(), players = players.values.toList(), permissions = permissions,
-                    fog = fogByMap[mapId] ?: LanFog()) }
+                    fog = fogByMap[mapId] ?: LanFog(), quests = campaignQuests, adventure = adventure) }
                 log("Мастер", "Создал комнату: $mapName")
                 while (!closed) {
                     val socket = try { listening.accept() } catch (_: Exception) { break }
@@ -582,8 +646,11 @@ internal class LanSession(
                                 connectedPeer.send(mapSelectionPacket())
                                 connectedPeer.send(JSONObject().put("type", "welcome").put("id", idClient).toString())
                                 connectedPeer.send(permissionMessage())
+                                connectedPeer.send(masterMovementPacket())
+                                connectedPeer.send(questsPacket(nameClient))
+                                connectedPeer.send(adventurePacket(idClient))
                                 conversation?.let { connectedPeer.send(conversationPacketForPeer(it, idClient)) }
-                                players[idClient] = LanPlayer(idClient, nameClient, 0.5f, 0.5f)
+                                players[idClient] = LanPlayer(idClient, nameClient, 0.5f, 0.5f, activeMapId)
                                 peers.add(connectedPeer)
                             }
                             publishPlayers()
@@ -602,6 +669,36 @@ internal class LanSession(
                                 if (action == "dialog_command") {
                                     handleDialogCommand(idClient, message)
                                 }
+                                if (action == "adventure_action") {
+                                    handleAdventureAction(idClient, message)
+                                }
+                                if (action == "adventure_delivery_ack") {
+                                    val deliveryId = message.optString("deliveryId")
+                                    val stored = synchronized(lock) { pendingDeliveries[deliveryId] }
+                                    val receipt = synchronized(lock) { adventure.pendingShop.firstOrNull {
+                                        it.id == deliveryId && it.characterId == charId(idClient)
+                                    } }
+                                    if (receipt != null) {
+                                        if (message.optBoolean("accepted")) {
+                                            synchronized(lock) { adventure = adventure.copy(pendingShop =
+                                                adventure.pendingShop.filterNot { it.id == deliveryId }) }
+                                            log("Магазин", "Покупка доставлена персонажу ${receipt.characterId} — ${receipt.cost} монет")
+                                            publishAdventure()
+                                        }
+                                    } else if (stored?.playerId == idClient) {
+                                        synchronized(lock) {
+                                            pendingDeliveries.remove(deliveryId)
+                                            if (message.optBoolean("accepted") && stored.chestMarkerId.isNotBlank()) {
+                                                adventure = adventure.copy(objects = adventure.objects.map { obj ->
+                                                    if (obj.markerId == stored.chestMarkerId)
+                                                        obj.copy(items = obj.items.filterNot { it.id == stored.chestItemId })
+                                                    else obj
+                                                })
+                                            }
+                                        }
+                                        publishAdventure()
+                                    }
+                                }
                                 if (action == "event") {
                                     log(nameClient, message.optString("action").take(160))
                                 }
@@ -617,17 +714,23 @@ internal class LanSession(
                                         else "${previous.second} — отклонено у $nameClient")
                                 }
                                 if (message.optString("type") == "move") {
+                                    // The server is authoritative: a late joystick packet
+                                    // cannot override a move being made by the host.
+                                    if (synchronized(lock) { masterMovingPlayerId == idClient }) continue
                                     val x = message.optDouble("x", Double.NaN)
                                     val y = message.optDouble("y", Double.NaN)
                                     if (x.isFinite() && y.isFinite()) {
                                         synchronized(lock) {
+                                            // Recheck under the same lock as host movement.
+                                            if (masterMovingPlayerId == idClient) return@synchronized
                                             val old = players[idClient]
                                             if (old != null) {
-                                                val fog = fogByMap[activeMapId] ?: LanFog()
+                                                val playerMapId = old.mapId.ifBlank { activeMapId }
+                                                val fog = fogByMap[playerMapId] ?: LanFog()
                                                 if (!fog.allowedPath(old.x, old.y, x.toFloat(), y.toFloat())) return@synchronized
                                                 val pos = x.toFloat().coerceIn(0f, 1f) to y.toFloat().coerceIn(0f, 1f)
                                                 players[idClient] = old.copy(x = pos.first, y = pos.second)
-                                                positions.getOrPut(activeMapId) { linkedMapOf() }[idClient] = pos
+                                                positions.getOrPut(old.mapId.ifBlank { activeMapId }) { linkedMapOf() }[idClient] = pos
                                             }
                                         }
                                         publishPlayers()
@@ -639,7 +742,14 @@ internal class LanSession(
                             peer?.let {
                                 synchronized(lock) {
                                     peers.remove(it); players.remove(it.id); snapshots.remove(it.id)
+                                    if (masterMovingPlayerId == it.id) masterMovingPlayerId = ""
                                     pendingEdits.entries.removeAll { entry -> entry.value.first == it.id }
+                                    openChests.remove(it.id)
+                                    openShops.remove(it.id)
+                                    pendingDeliveries.entries.removeAll { pending -> pending.value.playerId == it.id }
+                                    if (adventure.trade?.let { trade -> it.id == trade.proposer || it.id == trade.recipient } == true)
+                                        adventure = adventure.copy(trade = null)
+                                    if (adventure.vote != null) adventure = adventure.copy(vote = null)
                                     conversation?.let { active ->
                                         if (it.id in active.participants) {
                                             conversation = active.copy(
@@ -650,6 +760,7 @@ internal class LanSession(
                                 }
                                 update { old -> old.copy(characterSnapshots = synchronized(lock) { snapshots.map { (id, data) -> LanCharacterSnapshot(id, data) } }) }
                                 publishPlayers()
+                                broadcastAdventureOnDisconnect()
                                 broadcastConversation()
                                 log(nameClient, "Отключился")
                             }
@@ -757,7 +868,30 @@ internal class LanSession(
                                 }) else null
                             update { it.copy(conversation = current) }
                         }
+                        "adventure_state" -> {
+                            val world = AdventureWorld.parse(message.optJSONObject("world") ?: JSONObject())
+                            update { it.copy(adventure = world) }
+                        }
+                        "adventure_delivery" -> {
+                            val accepted = AdventureDelivery.apply(appContext, message)
+                            if (accepted) update { it.copy(inventoryRevision = it.inventoryRevision + 1) }
+                            val writer = outgoing
+                            if (writer != null) outbound.execute { try { synchronized(writer) {
+                                writer.write(JSONObject().put("type", "adventure_delivery_ack")
+                                    .put("deliveryId", message.optString("deliveryId"))
+                                    .put("accepted", accepted).toString())
+                                writer.newLine(); writer.flush()
+                            } } catch (_: Exception) {} }
+                        }
+                        "quest_list" -> {
+                            val room = message.optString("roomId")
+                            val quests = RpgQuestStorage.decode(message.optJSONArray("quests")?.toString() ?: "[]")
+                            if (room.isNotBlank()) update { it.copy(roomId = room, quests = quests, questsVersion = it.questsVersion + 1) }
+                        }
                         "welcome" -> update { it.copy(myId = message.optString("id")) }
+                        "master_movement" -> update { it.copy(
+                            masterMovingPlayerId = message.optString("playerId").take(100)
+                        ) }
                         "master_edit" -> receiveMasterEdit(message)
                         "permissions" -> update { it.copy(permissions = LanPermissions(
                             message.optBoolean("create"), message.optBoolean("moveOwn", true),
@@ -788,13 +922,13 @@ internal class LanSession(
                             val array = message.getJSONArray("list")
                             val list = (0 until array.length()).map { index ->
                                 val item = array.getJSONObject(index)
-                                LanPlayer(item.getString("id"), item.getString("name"), item.getDouble("x").toFloat(), item.getDouble("y").toFloat())
+                                LanPlayer(item.getString("id"), item.getString("name"), item.getDouble("x").toFloat(), item.getDouble("y").toFloat(), item.optString("mapId", activeMapId))
                             }
                             update { it.copy(players = list) }
                         }
                     }
                 }
-                if (!closed) update { it.copy(connected = false, status = "Хост отключился") }
+                if (!closed) update { it.copy(connected = false, status = "Хост отключился", masterMovingPlayerId = "") }
             } catch (e: Exception) {
                 val reason = when {
                     e is NoRouteToHostException || e.message?.contains("EHOSTUNREACH", ignoreCase = true) == true ->
@@ -806,7 +940,7 @@ internal class LanSession(
                     else -> e.message ?: e.javaClass.simpleName
                 }
                 val technical = e.message?.take(180)?.let { "\nПодробности: $it" } ?: ""
-                update { it.copy(connected = false, status = "Ошибка подключения: $reason$technical") }
+                update { it.copy(connected = false, status = "Ошибка подключения: $reason$technical", masterMovingPlayerId = "") }
             } finally {
                 try { client?.close() } catch (_: Exception) {}
                 client = null
@@ -842,8 +976,13 @@ internal class LanSession(
             when (action) {
                 "marker_delete" -> {
                     if (old != null && (senderId == "host" ||
+                        old.type !in setOf("Сундук", "Дверь", "Дом", "Магазин", "Портал", "Лагерь") &&
                         (old.ownerId == senderId && permissions.deleteOwnMarkers))) {
                         markers.remove(id)
+                        if (senderId == "host") {
+                            adventure = adventure.copy(objects = adventure.objects.filterNot { it.markerId == id })
+                            AdventureStorage.save(appContext, roomId, adventure)
+                        }
                         event = "Удалил метку «${old.name}»"
                         accepted = true
                     }
@@ -858,8 +997,8 @@ internal class LanSession(
                         (old.ownerId == senderId && permissions.moveOwnMarkers))
                     val markerType = message.optString("markerType", "Обычная").take(40)
                     val specialAllowed = senderId == "host" ||
-                        (markerType !in setOf("NPC", "Толпа", "Записка") &&
-                            old?.type !in setOf("NPC", "Толпа", "Записка"))
+                        (markerType !in setOf("NPC", "Толпа", "Записка", "Сундук", "Дверь", "Дом", "Магазин", "Портал", "Лагерь") &&
+                            old?.type !in setOf("NPC", "Толпа", "Записка", "Сундук", "Дверь", "Дом", "Магазин", "Портал", "Лагерь"))
                     if (allowed && specialAllowed && id.isNotBlank() && name.isNotBlank() && x.isFinite() && y.isFinite()) {
                         val owner = old?.ownerId ?: senderId
                         markers[id] = LanMarker(id, name,
@@ -867,13 +1006,20 @@ internal class LanSession(
                             markerType,
                             x.toFloat().coerceIn(0f, 1f), y.toFloat().coerceIn(0f, 1f), owner)
                         accepted = true
-                        if (action == "marker_add") event = "Создал метку «$name»"
+                        if (action == "marker_add") {
+                        event = "Создал метку «$name»"
+                        if (senderId == "host" && markerType in setOf("Сундук", "Дверь", "Дом", "Магазин", "Портал")) {
+                            adventure = adventure.copy(objects = adventure.objects +
+                                AdventureObject(id, affectedMapId, markerType))
+                        }
+                    }
                     }
                 }
             }
             snapshot = markers.values.toList()
         }
         if (!accepted) return
+        if (senderId == "host") publishAdventure()
         event?.let { log(senderName, it) }
         update { current -> current.copy(
             markers = if (current.activeMapId == affectedMapId) snapshot else current.markers,
@@ -928,7 +1074,8 @@ internal class LanSession(
         update { it.copy(players = snapshot) }
         val list = JSONArray()
         snapshot.forEach { player ->
-            list.put(JSONObject().put("id", player.id).put("name", player.name).put("x", player.x.toDouble()).put("y", player.y.toDouble()))
+            list.put(JSONObject().put("id", player.id).put("name", player.name).put("x", player.x.toDouble()).put("y", player.y.toDouble())
+                .put("mapId", player.mapId))
         }
         val msg = JSONObject().put("type", "players").put("list", list).toString()
         peers.forEach { peer ->
@@ -945,14 +1092,14 @@ internal class LanSession(
             val old = players[id] ?: return
             val pos = x.coerceIn(0f, 1f) to y.coerceIn(0f, 1f)
             players[id] = old.copy(x = pos.first, y = pos.second)
-            positions.getOrPut(activeMapId) { linkedMapOf() }[id] = pos
+            positions.getOrPut(old.mapId.ifBlank { activeMapId }) { linkedMapOf() }[id] = pos
         }
         update { it.copy(players = synchronized(lock) { players.values.toList() }) }
         broadcast.execute { if (!closed) publishPlayers() }
     }
 
     fun move(x: Float, y: Float) {
-        if (!state.connected) return
+        if (!state.connected || state.masterMovingPlayerId == state.myId) return
         val px = x.coerceIn(0f, 1f)
         val py = y.coerceIn(0f, 1f)
         if (hostMode) {
@@ -965,6 +1112,8 @@ internal class LanSession(
                 })
             }
             outbound.execute {
+                // A queued move must not slip out after the host acquires control.
+                if (state.masterMovingPlayerId == state.myId) return@execute
                 try {
                     synchronized(writer) {
                         writer.write(JSONObject().put("type", "move").put("x", px.toDouble()).put("y", py.toDouble()).toString())
@@ -1057,10 +1206,11 @@ internal class LanSession(
             when (action) {
                 "open", "global" -> {
                     val markerId = message.optString("markerId")
-                    val marker = markers[markerId] ?: return
+                    val targetMapId = if (actorId == "host") activeMapId else players[actorId]?.mapId ?: return
+                    val marker = markerSets[targetMapId]?.get(markerId) ?: return
                     if (marker.type != "NPC" && marker.type != "Толпа") return
                     if (actorId != "host") {
-                        if (!(fogByMap[activeMapId] ?: LanFog()).visible(marker.x, marker.y)) return
+                        if (!(fogByMap[targetMapId] ?: LanFog()).visible(marker.x, marker.y)) return
                         val player = players[actorId] ?: return
                         if (!lanMarkerInRange(player, marker)) return
                     }
@@ -1074,9 +1224,9 @@ internal class LanSession(
                         current?.history ?: emptyList())
                 }
                 "join" -> if (current != null && current.markerId == message.optString("markerId") && actorId in players) {
-                    val marker = markers[current.markerId] ?: return
                     val player = players[actorId] ?: return
-                    if (!(fogByMap[activeMapId] ?: LanFog()).visible(marker.x, marker.y)) return
+                    val marker = markerSets[player.mapId]?.get(current.markerId) ?: return
+                    if (!(fogByMap[player.mapId] ?: LanFog()).visible(marker.x, marker.y)) return
                     if (!lanMarkerInRange(player, marker)) return
                     conversation = current.copy(participants = (current.participants + actorId).distinct())
                 }
@@ -1104,7 +1254,424 @@ internal class LanSession(
         broadcastConversation()
     }
 
+    private fun broadcastAdventureOnDisconnect() {
+        if (hostMode) publishAdventure(false)
+    }
+
+    // Adventure actions run only on the host. Clients may request, never mutate world state.
+    private fun adventurePacket(viewerId: String): String = synchronized(lock) {
+        JSONObject().put("type", "adventure_state")
+            .put("world", adventure.json(viewerId, openChests[viewerId].orEmpty(),
+                openShops[viewerId].orEmpty(), charId(viewerId)).apply {
+                put("notice", peerNotices[viewerId].orEmpty())
+            }).toString()
+    }
+
+    private fun publishAdventure(persist: Boolean = true) {
+        if (persist) AdventureStorage.save(appContext, roomId, adventure.copy(vote = null, trade = null, notice = ""))
+        update { it.copy(adventure = adventure) }
+        broadcast.execute { peers.forEach { peer ->
+            try { synchronized(lock) { peer.send(adventurePacket(peer.id)) } } catch (_: Exception) { }
+        } }
+    }
+
+    /** Wallets belong to the campaign. Only the master may credit or correct them. */
+    fun setPlayerCoins(playerId: String, amount: Int) {
+        if (!hostMode || closed || amount !in 0..1_000_000_000) return
+        val characterId = synchronized(lock) { charId(playerId) }
+        if (characterId <= 0L || adventure.pendingShop.any { it.characterId == characterId }) return
+        synchronized(lock) {
+            adventure = adventure.copy(wallets = adventure.wallets + (characterId.toString() to amount))
+        }
+        publishAdventure()
+        log("Мастер", "Монеты персонажа ${characterId}: $amount")
+    }
+
+    private fun sendShopReceipt(playerId: String, purchase: AdventurePurchase) {
+        val peer = peers.firstOrNull { it.id == playerId } ?: return
+        val packet = JSONObject().put("type", "adventure_delivery")
+            .put("deliveryId", purchase.id).put("characterId", purchase.characterId)
+            .put("operation", "shop_buy")
+            .put("items", JSONArray().apply { purchase.items.forEach { put(it.json()) } }).toString()
+        broadcast.execute { try { peer.send(packet) } catch (_: Exception) { } }
+    }
+
+    fun editAdventureObject(value: AdventureObject) {
+        if (!hostMode || value.markerId.isBlank()) return
+        val marker = synchronized(lock) { markerSets[value.mapId]?.get(value.markerId) } ?: return
+        if (marker.type != value.kind || value.items.size > 100 ||
+            value.items.any { it.price !in 0..1_000_000 || it.stock !in 0..999 }) return
+        synchronized(lock) {
+            adventure = adventure.copy(objects = (adventure.objects.filterNot { it.markerId == value.markerId } + value))
+        }
+        publishAdventure()
+        log("Мастер", "Изменил объект «${marker.name}»")
+    }
+
+    private fun inventoryFor(id: String): List<JSONObject> {
+        val snapshot = snapshots[id]?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return emptyList()
+        val a = snapshot.optJSONArray("inventory") ?: return emptyList()
+        return (0 until a.length()).mapNotNull { a.optJSONObject(it) }
+    }
+
+    private fun charId(id: String): Long = snapshots[id]?.let {
+        runCatching { JSONObject(it).optLong("id", -1L) }.getOrNull()
+    } ?: -1L
+
+    private fun playerNearObject(id: String, obj: AdventureObject): Boolean {
+        val player = players[id] ?: return false
+        if (player.mapId != obj.mapId) return false
+        val marker = markerSets[obj.mapId]?.get(obj.markerId) ?: return false
+        return adventureDistanceNear(player.x, player.y, marker) &&
+            (fogByMap[obj.mapId] ?: LanFog()).visible(marker.x, marker.y)
+    }
+
+    private fun hasKey(id: String, obj: AdventureObject): Boolean = !obj.locked ||
+        inventoryFor(id).any { it.optString("description").contains("[KEY:${obj.keyId.ifBlank { obj.markerId }}]") }
+
+    private fun deliver(id: String, operation: String, data: JSONObject, label: String,
+                        chestMarkerId: String = "", chestItemId: String = "") {
+        val peer = peers.firstOrNull { it.id == id } ?: return
+        val characterId = charId(id)
+        if (characterId <= 0L) return
+        val deliveryId = UUID.randomUUID().toString()
+        val message = JSONObject().put("type", "adventure_delivery")
+            .put("deliveryId", deliveryId).put("characterId", characterId)
+            .put("operation", operation)
+        data.keys().forEach { key -> message.put(key, data.get(key)) }
+        pendingDeliveries[deliveryId] = PendingDelivery(id, label, chestMarkerId, chestItemId)
+        broadcast.execute { try { peer.send(message.toString()) } catch (_: Exception) { } }
+    }
+
+    fun adventureCommand(action: String, markerId: String = "", targetId: String = "",
+                         itemIds: List<Long> = emptyList(), cart: Map<String, Int> = emptyMap()) {
+        val data = JSONObject().put("type", "adventure_action").put("action", action)
+            .put("markerId", markerId).put("targetId", targetId)
+            .put("items", JSONArray(itemIds))
+            .put("cart", JSONArray().apply { cart.forEach { (id, quantity) ->
+                put(JSONObject().put("id", id).put("quantity", quantity))
+            } })
+        if (hostMode) handleAdventureAction("host", data)
+        else {
+            val writer = outgoing ?: return
+            outbound.execute { try { synchronized(writer) {
+                writer.write(data.toString()); writer.newLine(); writer.flush()
+            } } catch (_: Exception) { } }
+        }
+    }
+
+    /**
+     * Create an exit on the target map for every entrance/portal the first time
+     * it is used. Keep the same marker ID so master edits (including movement)
+     * survive subsequent visits and reconnects. Exits never spawn another exit.
+     */
+    private fun ensureReturnExit(source: AdventureObject) {
+        if (isAutoReturnMarker(source.markerId) || source.targetMapId !in roomMaps ||
+            source.mapId !in roomMaps) return
+        val sourceMarker = markerSets[source.mapId]?.get(source.markerId) ?: return
+        val exitId = AUTO_RETURN_MARKER_PREFIX + source.markerId
+        val targetMarkers = markerSets.getOrPut(source.targetMapId) { linkedMapOf() }
+        if (exitId in targetMarkers) return
+        targetMarkers[exitId] = LanMarker(exitId, "↩ Выход", "Вернуться: ${roomMaps[source.mapId]?.info?.name ?: "предыдущая карта"}",
+            "Дверь", source.x.coerceIn(0f,1f), source.y.coerceIn(0f,1f), "host")
+        adventure = adventure.copy(objects = adventure.objects.filterNot { it.markerId == exitId } +
+            AdventureObject(exitId, source.targetMapId, "Дверь", targetMapId = source.mapId,
+                x = sourceMarker.x, y = sourceMarker.y))
+        val saved = targetMarkers.values.toList()
+        LanRoomStorage.saveRoomMarkers(appContext, roomId, source.targetMapId, saved)
+        update { old -> old.copy(
+            roomMarkers = markerSnapshots(),
+            markers = if (old.activeMapId == source.targetMapId) saved else old.markers
+        ) }
+        val packet = markersMessage(source.targetMapId)
+        broadcast.execute { peers.forEach { peer -> try { peer.send(packet) } catch (_: Exception) {} } }
+        log("Мастер", "Создан обратный выход на карте «${roomMaps[source.targetMapId]?.info?.name}»")
+    }
+
+    /** Personal arrival does not change the host's camera or everybody else's map. */
+    private fun travelPlayer(playerId: String, destination: String, x: Float, y: Float,
+                             source: AdventureObject? = null) {
+        if (source != null) ensureReturnExit(source)
+        val player = players[playerId] ?: return
+        val target = roomMaps[destination] ?: return
+        val fog = fogByMap[destination] ?: LanFog()
+        if (fog.enabled && !fog.visible(x, y)) {
+            // Reveal only the landing point; keep all previously explored/hidden cells intact.
+            val safeArrival = fog.brush(x, y, erase = true, radius = 0.05f)
+            fogByMap[destination] = safeArrival
+            LanWorldStorage.saveFog(appContext, roomId, destination, safeArrival)
+        }
+        players[playerId] = player.copy(mapId = destination, x = x.coerceIn(0f, 1f), y = y.coerceIn(0f, 1f))
+        positions.getOrPut(destination) { linkedMapOf() }[playerId] = x to y
+        val peer = peers.firstOrNull { it.id == playerId } ?: return
+        broadcast.execute { try {
+            peer.send(JSONObject().put("type", "map_select").put("id", destination).toString())
+            peer.send(markersMessage(destination))
+            peer.send(fogPacket(destination))
+        } catch (_: Exception) {} }
+    }
+
+    private fun resolveVote() {
+        val vote = adventure.vote ?: return
+        if (vote.no.isNotEmpty()) { adventure = adventure.copy(vote = null, notice = "Групповой переход отклонён") ; return }
+        if (!vote.voters.all { it in vote.yes }) return
+        val obj = adventure.objects.firstOrNull { it.markerId == vote.markerId } ?: return
+        val stillFar = vote.voters.filterNot { id -> playerNearObject(id, obj) || id in vote.remoteNeedsScroll }
+        if (stillFar.isNotEmpty()) {
+            adventure = adventure.copy(notice = "Не все участники рядом. Дальние игроки могут применить свиток телепортации")
+            return
+        }
+        vote.voters.forEach { travelPlayer(it, vote.targetMapId, obj.x, obj.y, obj) }
+        adventure = adventure.copy(vote = null, notice = "Группа переместилась на другую карту")
+        publishPlayers()
+    }
+
+    /** Called by both local master buttons and socket messages. */
+    private fun handleAdventureAction(actor: String, data: JSONObject) {
+        if (!hostMode || closed) return
+        val action = data.optString("action")
+        val markerId = data.optString("markerId")
+        val target = data.optString("targetId")
+        synchronized(lock) {
+            peerNotices.remove(actor)
+            val obj = adventure.objects.firstOrNull { it.markerId == markerId }
+            val player = players[actor]
+            fun refuse(reason: String) {
+                if (actor != "host") peerNotices[actor] = reason.take(180)
+                else adventure = adventure.copy(notice = reason.take(180))
+            }
+            when (action) {
+                "open_chest" -> {
+                    if (obj?.kind != "Сундук" || !playerNearObject(actor, obj)) return
+                    if (!hasKey(actor, obj)) { refuse("Сундук заперт — нужен ключ"); publishAdventure(false); return }
+                    openChests[actor] = markerId
+                    adventure = adventure.copy(objects = adventure.objects.map {
+                        if (it.markerId == markerId) it.copy(opened = true) else it
+                    }, notice = "Сундук открыт")
+                }
+                "close_chest" -> openChests.remove(actor)
+                "open_shop" -> {
+                    if (obj == null || !obj.isShop() || !playerNearObject(actor, obj)) return
+                    if (!hasKey(actor, obj)) {
+                        refuse("Магазин заперт — нужен ключ"); publishAdventure(false); return
+                    }
+                    openShops[actor] = markerId
+                }
+                "close_shop" -> openShops.remove(actor)
+                "shop_buy" -> {
+                    if (obj == null || !obj.isShop() || openShops[actor] != markerId) return
+                    if (!playerNearObject(actor, obj)) {
+                        openShops.remove(actor)
+                        refuse("Подойди ближе к магазину"); publishAdventure(false); return
+                    }
+                    if (!hasKey(actor, obj)) { refuse("Магазин заперт — нужен ключ"); publishAdventure(false); return }
+                    val characterId = charId(actor)
+                    if (characterId <= 0L) { refuse("Сначала выбери персонажа"); return }
+                    if (adventure.pendingShop.any { it.characterId == characterId }) {
+                        refuse("Предыдущая покупка ещё доставляется"); publishAdventure(false); return
+                    }
+                    val lines = data.optJSONArray("cart") ?: return
+                    if (lines.length() !in 1..30) return
+                    val order = linkedMapOf<String, Int>()
+                    for (i in 0 until lines.length()) {
+                        val entry = lines.optJSONObject(i) ?: return
+                        val id = entry.optString("id")
+                        val count = entry.optInt("quantity", 0)
+                        if (id.isBlank() || id in order || count !in 1..99) return
+                        order[id] = count
+                    }
+                    if (order.values.sum() > 100) return
+                    val goods = order.map { (id, count) ->
+                        val item = obj.items.firstOrNull { it.id == id }
+                        if (item == null || item.stock < count || item.price <= 0) {
+                            refuse("Товар закончился или больше не продаётся"); publishAdventure(false); return
+                        }
+                        item to count
+                    }
+                    val costLong = goods.sumOf { (item, count) -> item.price.toLong() * count }
+                    val walletKey = characterId.toString()
+                    val balance = adventure.wallets[walletKey] ?: 0
+                    if (costLong <= 0L || costLong > balance) {
+                        refuse("Недостаточно монет: нужно $costLong, доступно $balance"); publishAdventure(false); return
+                    }
+                    val purchased = goods.flatMap { (item, count) ->
+                        List(count) { item.copy(id = UUID.randomUUID().toString(), stock = 1) }
+                    }
+                    val receipt = AdventurePurchase(UUID.randomUUID().toString(), characterId,
+                        markerId, purchased, costLong.toInt())
+                    adventure = adventure.copy(
+                        wallets = adventure.wallets + (walletKey to (balance - costLong.toInt())),
+                        objects = adventure.objects.map { record -> if (record.markerId != markerId) record
+                            else record.copy(items = record.items.map { item ->
+                                item.copy(stock = item.stock - (order[item.id] ?: 0))
+                            }) },
+                        pendingShop = adventure.pendingShop + receipt,
+                        notice = "Покупка на ${receipt.cost} монет оформлена")
+                    // Persist the debit, stock reservation and receipt before any network delivery.
+                    AdventureStorage.save(appContext, roomId, adventure)
+                    sendShopReceipt(actor, receipt)
+                    log("Магазин", "Заказ на ${receipt.cost} монет от персонажа $characterId")
+                }
+                "take" -> {
+                    if (obj?.kind != "Сундук" || openChests[actor] != markerId || !playerNearObject(actor,obj)) return
+                    if (charId(actor) <= 0L) { refuse("Сначала выбери персонажа"); return }
+                    val item = obj.items.firstOrNull { it.id == target } ?: return
+                    if (pendingDeliveries.values.any { it.chestItemId == item.id && it.chestMarkerId == markerId }) return
+                    deliver(actor, "add", JSONObject().put("item", item.json()), "Предмет ${item.name}", markerId, item.id)
+                    adventure = adventure.copy(notice = "Передача предмета: ${item.name}")
+                }
+                "enter", "group_vote" -> {
+                    if (obj == null || obj.kind !in setOf("Дверь", "Дом", "Портал", "Магазин") || !playerNearObject(actor,obj)) return
+                    if (!hasKey(actor,obj)) { refuse("Дверь закрыта. Необходим ключ"); publishAdventure(false); return }
+                    if (obj.isShop()) { refuse("Здесь магазин. Нажми «Торговать»"); return }
+                    if (obj.targetMapId !in roomMaps) { refuse("Мастер ещё не назначил карту назначения"); publishAdventure(false); return }
+                    if (action == "enter") {
+                        travelPlayer(actor, obj.targetMapId, obj.x, obj.y, obj)
+                        refuse("Переход выполнен")
+                        publishPlayers()
+                    } else if (adventure.vote == null && player != null) {
+                        adventure = adventure.copy(vote = AdventureVote(obj.markerId, obj.mapId, actor,
+                            obj.targetMapId, players.keys.toList(), yes = setOf(actor)), notice = "Предложен групповой переход")
+                        resolveVote()
+                    }
+                }
+                "vote_yes", "vote_no" -> {
+                    val vote = adventure.vote ?: return
+                    if (actor !in vote.voters || actor in vote.yes || actor in vote.no) return
+                    adventure = adventure.copy(vote = if (action == "vote_yes") vote.copy(yes = vote.yes + actor)
+                        else vote.copy(no = vote.no + actor))
+                    resolveVote()
+                }
+                "use_scroll" -> {
+                    val vote = adventure.vote ?: return
+                    if (actor !in vote.yes || actor in vote.remoteNeedsScroll) return
+                    val source = adventure.objects.firstOrNull { it.markerId == vote.markerId } ?: return
+                    if (playerNearObject(actor, source)) return
+                    val key = charId(actor).takeIf { it > 0L }?.toString() ?: return
+                    val used = adventure.scrollUses[key] ?: 0
+                    if (used >= 2) { refuse("Свиток телепортации использован дважды за день"); publishAdventure(false); return }
+                    adventure = adventure.copy(scrollUses = adventure.scrollUses + (key to used + 1),
+                        vote = vote.copy(remoteNeedsScroll = vote.remoteNeedsScroll + actor))
+                    resolveVote()
+                }
+                "trade_offer" -> {
+                    if (player == null || target == actor || target !in players || adventure.trade != null) return
+                    val selected = data.optJSONArray("items") ?: JSONArray()
+                    val ids = (0 until selected.length()).map { selected.optLong(it) }.distinct().take(20)
+                    if (ids.isEmpty() || ids.any { id -> inventoryFor(actor).none {
+                        it.optLong("id") == id && it.optString("name") != "Журнал приключений"
+                    } }) return
+                    if (ids.any { id -> inventoryFor(actor).any { it.optLong("id") == id && it.optString("name") == "Журнал приключений" } }) return
+                    adventure = adventure.copy(trade = AdventureTrade(proposer = actor, recipient = target, proposerItems = ids,
+                        proposerNames = inventoryFor(actor).filter { it.optLong("id") in ids }.map { it.optString("name").take(100) }))
+                }
+                "trade_counter" -> {
+                    val trade = adventure.trade ?: return
+                    if (actor != trade.recipient) return
+                    val array = data.optJSONArray("items") ?: JSONArray()
+                    val ids = (0 until array.length()).map { array.optLong(it) }.distinct().take(20)
+                    if (ids.any { id -> inventoryFor(actor).none { it.optLong("id") == id && it.optString("name") != "Журнал приключений" } }) return
+                    adventure = adventure.copy(trade = trade.copy(recipientItems = ids,
+                        recipientNames = inventoryFor(actor).filter { it.optLong("id") in ids }.map { it.optString("name").take(100) },
+                        proposerConfirmed = false, recipientConfirmed = false))
+                }
+                "trade_confirm" -> {
+                    val trade = adventure.trade ?: return
+                    if (actor != trade.proposer && actor != trade.recipient) return
+                    val updated = if (actor == trade.proposer) trade.copy(proposerConfirmed = true)
+                        else trade.copy(recipientConfirmed = true)
+                    adventure = adventure.copy(trade = updated)
+                    if (updated.proposerConfirmed && updated.recipientConfirmed) {
+                        val a = inventoryFor(trade.proposer)
+                        val b = inventoryFor(trade.recipient)
+                        val offerA = a.filter { it.optLong("id") in trade.proposerItems }
+                        val offerB = b.filter { it.optLong("id") in trade.recipientItems }
+                        if (offerA.size != trade.proposerItems.size || offerB.size != trade.recipientItems.size ||
+                            (offerA + offerB).any { it.optString("name") == "Журнал приключений" }) {
+                            adventure = adventure.copy(trade = null, notice = "Обмен отменён: предметы изменились")
+                        } else {
+                            // Each receiver gets a fresh unique local ID to avoid collisions.
+                            fun exchanged(base: List<JSONObject>, leaving: List<Long>, arrivals: List<JSONObject>): JSONObject =
+                                JSONObject().put("expectedIds", JSONArray(leaving))
+                                    .put("items", JSONArray().apply {
+                                        base.filter { it.optLong("id") !in leaving }.forEach { put(it) }
+                                        arrivals.forEach { item -> put(JSONObject(item.toString())
+                                            .put("id", UUID.randomUUID().mostSignificantBits and Long.MAX_VALUE)) }
+                                    })
+                            deliver(trade.proposer, "replace", exchanged(a, trade.proposerItems, offerB), "Обмен")
+                            deliver(trade.recipient, "replace", exchanged(b, trade.recipientItems, offerA), "Обмен")
+                            adventure = adventure.copy(trade = null, notice = "Обмен подтверждён")
+                        }
+                    }
+                }
+                "trade_cancel" -> {
+                    val trade = adventure.trade ?: return
+                    if (actor in setOf(trade.proposer, trade.recipient, "host"))
+                        adventure = adventure.copy(trade = null, notice = "Обмен отменён")
+                }
+                "camp" -> {
+                    if (player == null || adventure.phase != "day" || adventure.campMarkerId.isNotBlank()) return
+                    val group = players.values.toList()
+                    if (group.isEmpty() || group.any { it.mapId != player.mapId ||
+                        kotlin.math.hypot(it.x - player.x, it.y - player.y) > LAN_INTERACTION_RADIUS }) {
+                        refuse("Для лагеря вся группа должна собраться рядом"); publishAdventure(false); return
+                    }
+                    val id = UUID.randomUUID().toString()
+                    val camp = LanMarker(id, "Лагерь", "Место отдыха группы", "Лагерь", player.x, player.y, "host")
+                    markerSets.getOrPut(player.mapId) { linkedMapOf() }[id] = camp
+                    adventure = adventure.copy(campMarkerId = id, campMapId = player.mapId, notice = "Лагерь разбит")
+                    LanRoomStorage.saveRoomMarkers(appContext, roomId, player.mapId, markerSets[player.mapId]!!.values.toList())
+                    broadcast.execute { peers.forEach { try { it.send(markersMessage(player.mapId)) } catch (_: Exception) {} } }
+                    update { it.copy(markers = if (it.activeMapId == player.mapId) markerSets[player.mapId]!!.values.toList() else it.markers,
+                        roomMarkers = markerSnapshots()) }
+                }
+                "end_day" -> {
+                    if (actor != "host" || adventure.campMarkerId.isBlank() || adventure.phase != "day") return
+                    adventure = adventure.copy(phase = "night", notice = "Ночь. Группа отдыхает в лагере")
+                }
+                "start_day" -> {
+                    if (actor != "host" || adventure.phase != "night") return
+                    val campMap = adventure.campMapId
+                    markerSets[campMap]?.remove(adventure.campMarkerId)
+                    if (campMap.isNotBlank()) {
+                        LanRoomStorage.saveRoomMarkers(appContext, roomId, campMap,
+                            markerSets[campMap]?.values?.toList() ?: emptyList())
+                        broadcast.execute { peers.forEach { try { it.send(markersMessage(campMap)) } catch (_: Exception) {} } }
+                    }
+                    adventure = adventure.copy(day = adventure.day + 1, phase = "day",
+                        campMarkerId = "", campMapId = "", scrollUses = emptyMap(),
+                        notice = "Начался новый день. Здоровье и способности восстановлены")
+                    peers.forEach { peer ->
+                        val cid = charId(peer.id)
+                        if (cid > 0) editCharacterAsMaster(peer.id, cid, "adventure_rest", JSONObject(), "Восстановление после отдыха")
+                    }
+                    update { it.copy(roomMarkers = markerSnapshots(), markers = markerSets[activeMapId]?.values?.toList() ?: emptyList()) }
+                }
+                else -> return
+            }
+            Unit
+        }
+        publishAdventure()
+    }
+
+    fun giveHeroStory(playerId: String, positiveName: String, positive: String,
+                      negativeName: String, negative: String): Boolean {
+        if (!hostMode || adventure.phase != "night" || adventure.campMarkerId.isBlank()) return false
+        val id = charId(playerId)
+        if (id <= 0 || listOf(positiveName, negativeName, positive, negative).any { it.isBlank() }) return false
+        val payload = JSONObject().put("goodName", positiveName).put("goodEffect", positive)
+            .put("badName", negativeName).put("badEffect", negative)
+        if (!editCharacterAsMaster(playerId, id, "hero_story_pair", payload,
+                "Выдал/обновил дар и недостаток истории героя")) return false
+        // This flag still marks the story as told. It no longer blocks an explicit
+        // master-triggered replay from the World panel.
+        adventure = adventure.copy(heroStories = adventure.heroStories + id.toString())
+        publishAdventure()
+        return true
+    }
+
     fun close() {
+        if (hostMode) AdventureStorage.save(appContext, roomId, adventure)
         closed = true
         try { server?.close() } catch (_: Exception) {}
         try { client?.close() } catch (_: Exception) {}

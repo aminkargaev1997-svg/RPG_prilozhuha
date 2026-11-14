@@ -25,6 +25,46 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlin.math.hypot
+import kotlin.math.max
+
+/**
+ * Keeps the talent tree inside the visible viewport at any zoom level.
+ * A tree that is smaller than the viewport is centered; a larger tree can be
+ * panned only until its outer nodes reach the visible edges. This prevents
+ * empty screens after long drags and after the viewport changes size.
+ */
+private fun limitTreePan(
+    requested: Offset,
+    zoom: Float,
+    viewport: IntSize,
+    nodes: List<TalentNode>
+): Offset {
+    if (viewport.width <= 0 || viewport.height <= 0 || nodes.isEmpty()) return Offset.Zero
+
+    val minX = nodes.minOf { it.x } * zoom
+    val maxX = nodes.maxOf { it.x } * zoom
+    val minY = nodes.minOf { it.y } * zoom
+    val maxY = nodes.maxOf { it.y } * zoom
+    // Include the outer node circles and a little breathing room at the edges.
+    val edgeMargin = max(28f, 20f * zoom.coerceAtLeast(0.72f) + 8f)
+
+    fun constrain(value: Float, viewportSize: Float, low: Float, high: Float): Float {
+        val axisCenter = viewportSize / 2f
+        val visibleSize = (viewportSize - 2f * edgeMargin).coerceAtLeast(1f)
+        if (high - low <= visibleSize) {
+            // Nothing to pan along this axis: keep the complete tree centered.
+            return -(low + high) / 2f
+        }
+        val minimumPan = viewportSize - edgeMargin - axisCenter - high
+        val maximumPan = edgeMargin - axisCenter - low
+        return value.coerceIn(minimumPan, maximumPan)
+    }
+
+    return Offset(
+        constrain(requested.x, viewport.width.toFloat(), minX, maxX),
+        constrain(requested.y, viewport.height.toFloat(), minY, maxY)
+    )
+}
 
 /** Scalable independent Android Canvas tree. Learning never modifies base attributes. */
 @Composable
@@ -46,6 +86,12 @@ fun SkillTreeScreen(
     val available = SkillTreeEngine.totalPoints(character, state) - SkillTreeEngine.spent(nodes, state)
     val accent = Color(0xFFF2C777)
     val center = Offset(size.width / 2f, size.height / 2f) + pan
+    // Tap recognition should not restart on every drag/zoom frame.
+    val currentScale by rememberUpdatedState(scale)
+    val currentPan by rememberUpdatedState(pan)
+    val currentSize by rememberUpdatedState(size)
+    // The available canvas changes size when the device rotates or its layout changes.
+    LaunchedEffect(size, nodes) { pan = limitTreePan(pan, scale, size, nodes) }
     fun save(next: TalentState) { state = next; SkillTreeStorage.save(context, character.id, next); onUpdated?.invoke() }
 
     BoxWithConstraints(Modifier.fillMaxSize().background(Color(0xFF0D1524))) {
@@ -58,24 +104,28 @@ fun SkillTreeScreen(
                     Text("${character.race} · ${character.profession} · Ур. ${character.level}/20", color = Color.LightGray, style = MaterialTheme.typography.labelSmall)
                 }
                 Text("Очков: $available", color = accent)
-                TextButton(onClick = { pan = Offset.Zero; scale = 0.58f }) { Text("Центр", color = accent) }
+                TextButton(onClick = { scale = 0.58f; pan = limitTreePan(Offset.Zero, 0.58f, size, nodes) }) { Text("Центр", color = accent) }
                 if (asMaster) TextButton(onClick = { confirmReset = true }) { Text("Сброс", color = accent) }
             }
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 Canvas(Modifier.fillMaxSize().onSizeChanged { size = it }
-                    .pointerInput(character.id, size, nodes, scale, pan) {
+                    .pointerInput(character.id, nodes) {
                         detectTapGestures { tap ->
+                            val tapCenter = Offset(currentSize.width / 2f, currentSize.height / 2f) + currentPan
                             val hit = nodes.asReversed().firstOrNull { node ->
-                                val pos = center + Offset(node.x * scale, node.y * scale)
-                                hypot((pos.x - tap.x).toDouble(), (pos.y - tap.y).toDouble()) < (if (node.id == "root") 27f else 18f) * scale.coerceAtLeast(0.65f)
+                                val pos = tapCenter + Offset(node.x * currentScale, node.y * currentScale)
+                                hypot((pos.x - tap.x).toDouble(), (pos.y - tap.y).toDouble()) <
+                                    (if (node.id == "root") 27f else 18f) * currentScale.coerceAtLeast(0.65f)
                             }
                             if (hit != null && hit.id != "root") selected = hit
                         }
                     }
-                    .pointerInput(character.id) {
+                    .pointerInput(character.id, size, nodes) {
                         detectTransformGestures { centroid, movement, zoom, _ ->
                             val next = (scale * zoom).coerceIn(0.24f, 2.3f)
-                            pan += movement + (centroid - Offset(size.width / 2f, size.height / 2f) - pan) * (1f - next / scale)
+                            val requested = pan + movement +
+                                (centroid - Offset(size.width / 2f, size.height / 2f) - pan) * (1f - next / scale)
+                            pan = limitTreePan(requested, next, size, nodes)
                             scale = next
                         }
                     }) {

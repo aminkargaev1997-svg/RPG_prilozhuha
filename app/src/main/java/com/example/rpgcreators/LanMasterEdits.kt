@@ -104,7 +104,8 @@ internal fun applyLanMasterEdit(
                     id = if (index >= 0) id else System.nanoTime(),
                     name = name,
                     quantity = data.optString("quantity").take(60),
-                    description = data.optString("description").take(500)
+                    description = data.optString("description").take(500),
+                    category = data.optString("category", "Прочее").take(60)
                 )
                 if (index >= 0) current[index] = item else current.add(item)
                 CharacterStorage.saveInventory(context, edit.characterId, current)
@@ -112,7 +113,7 @@ internal fun applyLanMasterEdit(
             "item_delete" -> {
                 val id = data.optLong("id", 0)
                 val current = CharacterStorage.loadInventory(context, edit.characterId).toMutableList()
-                if (current.none { it.id == id }) return false
+                if (current.none { it.id == id } || current.any { it.id == id && CharacterStorage.isBoundItem(it) }) return false
                 current.removeAll { it.id == id }
                 CharacterStorage.saveInventory(context, edit.characterId, current)
                 val equipment = CharacterStorage.loadEquipment(context, edit.characterId)
@@ -131,10 +132,38 @@ internal fun applyLanMasterEdit(
                     description = data.optString("description").take(500),
                     activatorDescription = data.optString("activator").take(500),
                     passiveDescription = data.optString("passive").take(500),
-                    isUsed = data.optBoolean("used", false)
+                    isUsed = data.optBoolean("used", false),
+                    origin = if (index >= 0) current[index].origin.ifBlank {
+                        if (current[index].isStoryTrait) "hero_story" else ""
+                    } else ""
                 )
                 if (index >= 0) current[index] = ability else current.add(ability)
                 CharacterStorage.saveAbilities(context, edit.characterId, current)
+            }
+            "hero_story_pair" -> {
+                // The master can replay a story. Replace the previous two traits in one
+                // local save instead of stacking duplicates or leaving half a pair.
+                val goodName = data.optString("goodName").trim().take(100)
+                val badName = data.optString("badName").trim().take(100)
+                val goodEffect = data.optString("goodEffect").trim().take(500)
+                val badEffect = data.optString("badEffect").trim().take(500)
+                if (listOf(goodName, badName, goodEffect, badEffect).any { it.isBlank() }) return false
+                val current = CharacterStorage.loadAbilities(context, edit.characterId)
+                    .filterNot { it.isStoryTrait }.toMutableList()
+                val baseId = System.nanoTime()
+                current.add(Ability(id = baseId, name = goodName,
+                    description = "Дар из истории героя", passiveDescription = goodEffect,
+                    origin = "hero_story"))
+                current.add(Ability(id = baseId + 1, name = badName,
+                    description = "Недостаток из истории героя", passiveDescription = badEffect,
+                    origin = "hero_story"))
+                CharacterStorage.saveAbilities(context, edit.characterId, current)
+            }
+            "adventure_rest" -> {
+                // End-of-night restoration. Passive features stay unchanged.
+                val abilities = CharacterStorage.loadAbilities(context, edit.characterId)
+                CharacterStorage.saveAbilities(context, edit.characterId, abilities.map { it.copy(isUsed = false) })
+                AdventureVitalsStorage.fullRest(context, edit.characterId)
             }
             "ability_delete" -> {
                 val id = data.optLong("id", 0)

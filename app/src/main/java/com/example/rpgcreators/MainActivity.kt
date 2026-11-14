@@ -167,8 +167,30 @@ fun AppScreen(modifier: Modifier = Modifier) {
                 onBack = { currentScreen = "details" },
                 onAbilities = { currentScreen = "abilities" },
                 onTalents = { currentScreen = "talents" },
+                onJournal = { currentScreen = "journal" },
                 onMaps = { currentScreen = "maps" }
             )
+        }
+
+        "journal" -> selectedCharacter?.let { character ->
+            val key = RpgQuestStorage.personalKey(character.id)
+            var own by remember(character.id) { mutableStateOf(RpgQuestStorage.load(context, key)) }
+            var journalTab by remember(character.id) { mutableStateOf("personal") }
+            Column(Modifier.fillMaxSize()) {
+                Row(Modifier.fillMaxWidth().padding(horizontal=12.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected=journalTab=="personal",onClick={journalTab="personal"},label={Text("Личные задания")})
+                    FilterChip(selected=journalTab=="network",onClick={journalTab="network"},label={Text("Сетевые (офлайн)")})
+                }
+                Box(Modifier.weight(1f)) {
+                    if (journalTab=="personal") RpgQuestJournalScreen(quests=own,
+                        onBack={currentScreen="game"},onSave={list->
+                            own=list; RpgQuestStorage.save(context,key,list)
+                        },title="Личный журнал заданий")
+                    else RpgQuestJournalScreen(
+                        quests=RpgQuestStorage.cachedCampaignQuests(context,character.id),
+                        onBack={currentScreen="game"},title="Сохранённые задания кампаний")
+                }
+            }
         }
 
         "talents" -> selectedCharacter?.let { character ->
@@ -580,7 +602,8 @@ data class InventoryItem(
     val name: String,
     val quantity: String = "",
     val description: String = "",
-    val position: Offset = Offset.Zero
+    val position: Offset = Offset.Zero,
+    val category: String = "Прочее"
 )
 
 data class Ability(
@@ -589,8 +612,12 @@ data class Ability(
     val description: String = "",
     val activatorDescription: String = "",
     val passiveDescription: String = "",
-    val isUsed: Boolean = false
+    val isUsed: Boolean = false,
+    val origin: String = "" // "hero_story" means only the master may edit/delete this trait.
 ) {
+    val isStoryTrait: Boolean
+        get() = origin == "hero_story" || description == "Положительная черта истории героя" ||
+            description == "Отрицательная черта истории героя"
     val isPassive: Boolean
         get() = passiveDescription.isNotBlank()
 }
@@ -638,6 +665,7 @@ fun GameScreen(
     onAbilities: () -> Unit,
     onTalents: () -> Unit = {},
     onMaps: () -> Unit,
+    onJournal: () -> Unit = {},
     showNavigation: Boolean = true,
     onEvent: (String) -> Unit = {}
 ) {
@@ -685,6 +713,13 @@ fun GameScreen(
         }
     }
 
+    var showVitals by remember(character.id) { mutableStateOf(false) }
+    var maximumHealth by remember(character.id) {
+        mutableIntStateOf(AdventureVitalsStorage.maxHealth(context, character.id))
+    }
+    var currentHealth by remember(character.id) {
+        mutableIntStateOf(AdventureVitalsStorage.currentHealth(context, character.id))
+    }
     val talentBonuses = SkillTreeEngine.bonus(character, SkillTreeStorage.load(context, character.id))
     var showInventoryCatalog by remember { mutableStateOf(false) }
     var showAddDialog by remember { mutableStateOf(false) }
@@ -696,6 +731,11 @@ fun GameScreen(
     var showInventoryDetails by remember { mutableStateOf(false) }
     var hasQuantity by remember { mutableStateOf(false) }
     var itemQuantity by remember { mutableStateOf("") }
+    var itemCategory by remember { mutableStateOf("Прочее") }
+    var inventoryQuery by rememberSaveable(character.id) { mutableStateOf("") }
+    var inventoryCategory by rememberSaveable(character.id) { mutableStateOf("Все") }
+    var inventorySort by rememberSaveable(character.id) { mutableStateOf("Новые") }
+    var inventoryListMode by rememberSaveable(character.id) { mutableStateOf(false) }
 
     var selectedSlot by remember { mutableStateOf<String?>(null) }
     var editingAttribute by remember { mutableStateOf<String?>(null) }
@@ -743,6 +783,28 @@ fun GameScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
+        TextButton(onClick = { showVitals = !showVitals }) {
+            Text("❤ Здоровье: $currentHealth / $maximumHealth  ${if (showVitals) "▴" else "▾"}")
+        }
+        if (showVitals) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("Текущее здоровье", style = MaterialTheme.typography.labelMedium)
+                Slider(value = currentHealth.toFloat(), onValueChange = { value ->
+                    currentHealth = value.toInt().coerceIn(0, maximumHealth)
+                }, onValueChangeFinished = {
+                    AdventureVitalsStorage.save(context, character.id, currentHealth, maximumHealth)
+                }, valueRange = 0f..maximumHealth.toFloat())
+                var maxText by remember(character.id) { mutableStateOf(maximumHealth.toString()) }
+                OutlinedTextField(value = maxText, onValueChange = { maxText = it.filter(Char::isDigit).take(5) },
+                    label = { Text("Максимум здоровья") }, singleLine = true)
+                TextButton(onClick = {
+                    maximumHealth = (maxText.toIntOrNull() ?: maximumHealth).coerceIn(1, 99999)
+                    currentHealth = currentHealth.coerceAtMost(maximumHealth)
+                    AdventureVitalsStorage.save(context, character.id, currentHealth, maximumHealth)
+                }) { Text("Сохранить максимум") }
+            }
+        }
+
         if (showNavigation) Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -761,6 +823,10 @@ fun GameScreen(
                 Text("🗺 Карты")
             }
         }
+
+        if (showNavigation) OutlinedButton(
+            onClick = onJournal, modifier = Modifier.fillMaxWidth()
+        ) { Text("📖 Журнал заданий") }
 
         if (showNavigation) OutlinedButton(
             onClick = onTalents,
@@ -892,6 +958,69 @@ fun GameScreen(
             fontWeight = FontWeight.Bold
         )
 
+        // Inventory view keeps the old draggable field, but large inventories
+        // switch automatically to a searchable scrollable list.
+        OutlinedTextField(value=inventoryQuery,onValueChange={inventoryQuery=it},
+            label={Text("Поиск предмета")},singleLine=true,modifier=Modifier.fillMaxWidth())
+        Row(horizontalArrangement=Arrangement.spacedBy(6.dp)) {
+            var catOpen by remember { mutableStateOf(false) }
+            Box {
+                OutlinedButton(onClick={catOpen=true}){Text(inventoryCategory)}
+                DropdownMenu(expanded=catOpen,onDismissRequest={catOpen=false}) {
+                    (listOf("Все") + inventoryItems.map { it.category }.distinct().sorted()).forEach { cat ->
+                        DropdownMenuItem(text={Text(cat)},onClick={inventoryCategory=cat;catOpen=false})
+                    }
+                }
+            }
+            var sortOpen by remember { mutableStateOf(false) }
+            Box {
+                OutlinedButton(onClick={sortOpen=true}){Text("↕ $inventorySort")}
+                DropdownMenu(expanded=sortOpen,onDismissRequest={sortOpen=false}) {
+                    listOf("Новые","А–Я","По категории","Количество").forEach { option ->
+                        DropdownMenuItem(text={Text(option)},onClick={inventorySort=option;sortOpen=false})
+                    }
+                }
+            }
+            TextButton(onClick={inventoryListMode=!inventoryListMode}){Text(if(inventoryListMode) "Поле" else "Список")}
+        }
+        val filteredInventory = inventoryItems.filter { item ->
+            item.name.contains(inventoryQuery,ignoreCase=true) &&
+            (inventoryCategory=="Все" || item.category==inventoryCategory)
+        }.let { list -> when(inventorySort) {
+            "А–Я" -> list.sortedBy { it.name.lowercase() }
+            "По категории" -> list.sortedWith(compareBy<InventoryItem>{it.category}.thenBy{it.name})
+            "Количество" -> list.sortedByDescending { it.quantity.toIntOrNull() ?: 1 }
+            else -> list.sortedByDescending { it.id }
+        } }
+        val showInventoryList = inventoryListMode || inventoryItems.size > 8 ||
+            inventoryQuery.isNotBlank() || inventoryCategory != "Все"
+        if(showInventoryList) {
+            Text("Найдено: ${filteredInventory.size} из ${inventoryItems.size}",
+                style=MaterialTheme.typography.bodySmall)
+            Column(Modifier.fillMaxWidth().heightIn(max=300.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement=Arrangement.spacedBy(5.dp)) {
+                filteredInventory.forEach { item ->
+                    Card(Modifier.fillMaxWidth().clickable {
+                        if(deleteMode) {
+                            if(CharacterStorage.isBoundItem(item)) return@clickable
+                            inventoryItems.removeAll { it.id == item.id }
+                            equipment.entries.removeAll { it.value == item.id }
+                            positions.remove(item.id)
+                            saveInventory(); saveEquipment()
+                        } else if(CharacterStorage.isJournalItem(item)) onJournal()
+                        else { selectedInventoryItem=item;showInventoryDetails=false }
+                    }) {
+                        Row(Modifier.fillMaxWidth().padding(12.dp),horizontalArrangement=Arrangement.SpaceBetween) {
+                            Column(Modifier.weight(1f)) {
+                                Text(item.name, fontWeight=FontWeight.Bold)
+                                Text(item.category,style=MaterialTheme.typography.bodySmall)
+                            }
+                            Text(if(CharacterStorage.isBoundItem(item)) "🔒" else if(deleteMode) "Удалить" else if(item.quantity.isNotBlank()) "×${item.quantity}" else "Открыть")
+                        }
+                    }
+                }
+            }
+        } else {
         BoxWithConstraints(
             Modifier
                 .fillMaxWidth()
@@ -970,6 +1099,7 @@ fun GameScreen(
                         .pointerInput(item.id, deleteMode, maxX, maxY) {
                             if (deleteMode) {
                                 detectTapGestures {
+                                    if (CharacterStorage.isBoundItem(item)) return@detectTapGestures
                                     inventoryItems.removeAll {
                                         it.id == item.id
                                     }
@@ -998,8 +1128,8 @@ fun GameScreen(
                         }
                         .pointerInput(item.id, deleteMode) {
                             if (!deleteMode) detectTapGestures {
-                                selectedInventoryItem = item
-                                showInventoryDetails = false
+                                if (CharacterStorage.isJournalItem(item)) onJournal()
+                                else { selectedInventoryItem = item; showInventoryDetails = false }
                             }
                         },
                     contentAlignment = Alignment.Center
@@ -1029,6 +1159,8 @@ fun GameScreen(
             }
         }
 
+        } // End draggable inventory field
+
         Text(
             if (deleteMode) {
                 "Нажми на предмет, чтобы удалить его."
@@ -1049,6 +1181,7 @@ fun GameScreen(
                     itemName = ""
                     itemDescription = ""
                     itemQuantity = ""
+                    itemCategory = "Прочее"
                     hasQuantity = false
                     showAddDialog = true
                 },
@@ -1082,6 +1215,25 @@ fun GameScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     if (item.quantity.isNotBlank()) Text("Количество: ${item.quantity}")
+                    Text("Категория: ${item.category}")
+                    var changeCategoryMenu by remember(item.id) { mutableStateOf(false) }
+                    Box {
+                        TextButton(onClick={changeCategoryMenu=true}){Text("Изменить категорию")}
+                        DropdownMenu(expanded=changeCategoryMenu,onDismissRequest={changeCategoryMenu=false}) {
+                            listOf("Оружие","Броня","Расходники","Материалы","Квестовые","Инструменты","Прочее").forEach { category ->
+                                DropdownMenuItem(text={Text(category)},onClick={
+                                    val index=inventoryItems.indexOfFirst { it.id==item.id }
+                                    if(index>=0) {
+                                        val newer=item.copy(category=category)
+                                        inventoryItems[index]=newer
+                                        selectedInventoryItem=newer
+                                        saveInventory()
+                                    }
+                                    changeCategoryMenu=false
+                                })
+                            }
+                        }
+                    }
                     if (showInventoryDetails) {
                         Text(item.description.ifBlank { "Описание не добавлено." })
                     } else {
@@ -1131,6 +1283,17 @@ fun GameScreen(
                         minLines = 2
                     )
 
+                    Text("Категория")
+                    var categoryMenuOpen by remember { mutableStateOf(false) }
+                    Box {
+                        OutlinedButton(onClick={categoryMenuOpen=true}){Text(itemCategory)}
+                        DropdownMenu(expanded=categoryMenuOpen,onDismissRequest={categoryMenuOpen=false}) {
+                            listOf("Оружие","Броня","Расходники","Материалы","Квестовые","Инструменты","Прочее").forEach { c ->
+                                DropdownMenuItem(text={Text(c)},onClick={itemCategory=c;categoryMenuOpen=false})
+                            }
+                        }
+                    }
+
                     Row(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -1163,6 +1326,7 @@ fun GameScreen(
                             InventoryItem(
                                 name = itemName.trim(),
                                 description = itemDescription.trim(),
+                                category = itemCategory,
                                 quantity = if (hasQuantity) {
                                     itemQuantity.trim()
                                 } else {
@@ -1178,6 +1342,7 @@ fun GameScreen(
                         itemName = ""
                         itemDescription = ""
                         itemQuantity = ""
+                        itemCategory = "Прочее"
                         hasQuantity = false
                     }
                 ) {
@@ -1469,7 +1634,7 @@ fun AbilitiesScreen(
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable(enabled = deleteMode) {
+                    .clickable(enabled = deleteMode && !ability.isStoryTrait) {
                         abilityForDelete = ability
                     },
                 colors = CardDefaults.cardColors(
@@ -1581,7 +1746,10 @@ fun AbilitiesScreen(
                         }
                     }
 
-                    if (deleteMode) {
+                    if (ability.isStoryTrait) {
+                        Text("🔒 Особенность истории героя. Изменять и удалять может только мастер.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                    } else if (deleteMode) {
                         Text(
                             "Нажми на эту карточку для удаления",
                             color = MaterialTheme.colorScheme.error,
@@ -1766,6 +1934,7 @@ fun AbilitiesScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
+                        if (ability.isStoryTrait) { abilityForDelete = null; return@TextButton }
                         abilities.removeAll { it.id == ability.id }
                         saveAbilities()
                         onEvent("Удалил способность «${ability.name}»")
