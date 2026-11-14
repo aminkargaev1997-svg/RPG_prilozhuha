@@ -168,6 +168,7 @@ fun AppScreen(modifier: Modifier = Modifier) {
                 onAbilities = { currentScreen = "abilities" },
                 onTalents = { currentScreen = "talents" },
                 onJournal = { currentScreen = "journal" },
+                onNotes = { currentScreen = "notes" },
                 onMaps = { currentScreen = "maps" }
             )
         }
@@ -191,6 +192,10 @@ fun AppScreen(modifier: Modifier = Modifier) {
                         onBack={currentScreen="game"},title="Сохранённые задания кампаний")
                 }
             }
+        }
+
+        "notes" -> selectedCharacter?.let { character ->
+            RpgPersonalNotesScreen(character.id, onBack = { currentScreen = "game" })
         }
 
         "talents" -> selectedCharacter?.let { character ->
@@ -666,6 +671,7 @@ fun GameScreen(
     onTalents: () -> Unit = {},
     onMaps: () -> Unit,
     onJournal: () -> Unit = {},
+    onNotes: () -> Unit = {},
     showNavigation: Boolean = true,
     onEvent: (String) -> Unit = {}
 ) {
@@ -824,9 +830,10 @@ fun GameScreen(
             }
         }
 
-        if (showNavigation) OutlinedButton(
-            onClick = onJournal, modifier = Modifier.fillMaxWidth()
-        ) { Text("📖 Журнал заданий") }
+        if (showNavigation) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onJournal, modifier = Modifier.weight(1f)) { Text("📖 Задания") }
+            OutlinedButton(onClick = onNotes, modifier = Modifier.weight(1f)) { Text("✎ Заметки") }
+        }
 
         if (showNavigation) OutlinedButton(
             onClick = onTalents,

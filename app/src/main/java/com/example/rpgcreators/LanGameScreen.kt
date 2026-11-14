@@ -1370,6 +1370,18 @@ fun LanGameScreen(
         }
     }
 
+    if (page == "notes" && state.connected && !isMaster && activeCharacter != null) {
+        androidx.compose.ui.window.Dialog(
+            onDismissRequest = { page = journalReturnPage },
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Surface(Modifier.fillMaxSize()) {
+                RpgPersonalNotesScreen(activeCharacter.id, onBack = { page = journalReturnPage })
+            }
+        }
+        return
+    }
+
     if (page == "quests" && state.connected) {
         androidx.compose.ui.window.Dialog(
             onDismissRequest={page=journalReturnPage},
@@ -1575,6 +1587,9 @@ fun LanGameScreen(
                     OutlinedButton(onClick={journalReturnPage="map";page="quests"}, modifier=Modifier.fillMaxWidth()) {
                         Text("📖 Журнал",fontSize=12.sp)
                     }
+                    OutlinedButton(onClick={journalReturnPage="map";page="notes"}, modifier=Modifier.fillMaxWidth()) {
+                        Text("✎ Заметки",fontSize=12.sp)
+                    }
                 }
                 Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
                     mapContent(true)
@@ -1618,6 +1633,7 @@ fun LanGameScreen(
                     FilterChip(selected = page == "game", onClick = { page = "game" }, label = { Text("Персонаж") })
                     FilterChip(selected = page == "abilities", onClick = { page = "abilities" }, label = { Text("Способности") })
                     FilterChip(selected=false,onClick={journalReturnPage=page;page="quests"},label={Text("Журнал")})
+                    FilterChip(selected=false,onClick={journalReturnPage=page;page="notes"},label={Text("Заметки")})
                     if (state.permissions.skillTreeEnabled) FilterChip(
                         selected = page == "talents", onClick = { page = "talents" }, label = { Text("Древо") })
                 }
@@ -1637,6 +1653,7 @@ fun LanGameScreen(
                             onBack = { page = "map" },
                             onAbilities = { page = "abilities" },
                             onJournal = { journalReturnPage="game";page="quests" },
+                            onNotes = { journalReturnPage="game";page="notes" },
                             onMaps = { page = "map" },
                             showNavigation = false,
                             onEvent = { session.sendEvent(it) }
