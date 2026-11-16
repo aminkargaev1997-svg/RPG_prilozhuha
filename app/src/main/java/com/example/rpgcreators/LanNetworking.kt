@@ -28,7 +28,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 internal const val LAN_PORT = 8988
 internal const val LAN_MAX_IMAGE = 4 * 1024 * 1024
 
-internal data class LanPlayer(val id: String, val name: String, val x: Float, val y: Float, val mapId: String = "")
+internal data class LanPlayer(val id: String, val name: String, val x: Float, val y: Float, val mapId: String = "", val hp: Int = -1, val maxHp: Int = -1)
 internal data class LanPermissions(
     val createMarkers: Boolean = false,
     val moveOwnMarkers: Boolean = true,
@@ -62,7 +62,8 @@ internal data class LanState(
     val markers: List<LanMarker> = emptyList(),
     val permissions: LanPermissions = LanPermissions(),
     val logs: List<LanLog> = emptyList(),
-    val characterSnapshots: List<LanCharacterSnapshot> = emptyList()
+    val characterSnapshots: List<LanCharacterSnapshot> = emptyList(),
+    val combat: CombatState = CombatState()
 )
 
 // Trial interaction range in normalized map coordinates. Independent of zoom and screen pixels.
@@ -80,8 +81,51 @@ internal data class LanMarker(
     val type: String,
     val x: Float,
     val y: Float,
-    val ownerId: String = "host"
+    val ownerId: String = "host",
+    val hp: Int = if (type in setOf("Враг", "Босс", "NPC", "Союзник", "Игрок", "Торговец")) 10 else -1,
+    val maxHp: Int = if (type in setOf("Враг", "Босс", "NPC", "Союзник", "Игрок", "Торговец")) 10 else -1,
+    val hidden: Boolean = false,
+    val revealMode: String = "zone", // zone, touch, manual
+    val revealShape: String = "circle", // circle, rect
+    val revealRadiusX: Float = 0.035f,
+    val revealRadiusY: Float = 0.035f,
+    val revealTo: String = "all", // all, one
+    val revealedAll: Boolean = false,
+    val revealedFor: Set<String> = emptySet()
 )
+
+// Detection uses normalized IMAGE coordinates, not screen pixels or zoom.
+// Segment intersection catches a player moving across a narrow trigger in one joystick update.
+internal fun lanMarkerTriggerHit(marker: LanMarker, oldX: Float, oldY: Float, x: Float, y: Float): Boolean {
+    val rx = marker.revealRadiusX.coerceIn(0.005f, 1f)
+    val ry = marker.revealRadiusY.coerceIn(0.005f, 1f)
+    val dx = x - oldX
+    val dy = y - oldY
+    if (marker.revealShape == "rect") {
+        // Liang-Barsky clipping of the player path against a rectangle.
+        val left = marker.x - rx; val right = marker.x + rx
+        val top = marker.y - ry; val bottom = marker.y + ry
+        var begin = 0f; var end = 1f
+        val pp = floatArrayOf(-dx, dx, -dy, dy)
+        val qq = floatArrayOf(oldX - left, right - oldX, oldY - top, bottom - oldY)
+        for (i in 0..3) {
+            if (kotlin.math.abs(pp[i]) < 0.000001f) { if (qq[i] < 0f) return false }
+            else {
+                val t = qq[i] / pp[i]
+                if (pp[i] < 0f) begin = kotlin.math.max(begin, t)
+                else end = kotlin.math.min(end, t)
+                if (begin > end) return false
+            }
+        }
+        return true
+    }
+    val sx = (oldX - marker.x) / rx; val sy = (oldY - marker.y) / ry
+    val vx = dx / rx; val vy = dy / ry
+    val norm = vx * vx + vy * vy
+    val t = if (norm < 0.000001f) 0f else (-(sx * vx + sy * vy) / norm).coerceIn(0f, 1f)
+    val hitX = sx + t * vx; val hitY = sy + t * vy
+    return hitX * hitX + hitY * hitY <= 1f
+}
 
 // Android can expose both cellular and hotspot addresses simultaneously.
 // Never assume that the first private IPv4 address belongs to Wi-Fi.
@@ -172,6 +216,20 @@ internal class LanSession(
     private val roomMaps = linkedMapOf<String, RoomMap>()
     private val markerSets = linkedMapOf<String, LinkedHashMap<String, LanMarker>>()
     private val positions = linkedMapOf<String, MutableMap<String, Pair<Float, Float>>>()
+    // Session peer IDs change every reconnect; persistent identity does not.
+    private val guestIdentities = linkedMapOf<String, String>()
+    private val lastPositionSavedAt = linkedMapOf<String, Long>()
+    private fun rememberGuestPosition(playerId: String, mapId: String, x: Float, y: Float,
+                                      force: Boolean = false) {
+        val identity = guestIdentities[playerId] ?: return
+        // A joystick sends many packets per second; don't write preferences for every frame.
+        val now = System.currentTimeMillis()
+        val saveKey = "$playerId:$mapId"
+        if (!force && now - (lastPositionSavedAt[saveKey] ?: 0L) < 800L) return
+        lastPositionSavedAt[saveKey] = now
+        LanRoomStorage.savePlayerPosition(appContext, roomId, identity, mapId, x, y)
+    }
+
     private val fogByMap = linkedMapOf<String, LanFog>()
     private var conversation: LanConversation? = null
     private val markers: LinkedHashMap<String, LanMarker>
@@ -185,7 +243,12 @@ internal class LanSession(
     private val pendingDeliveries = linkedMapOf<String, PendingDelivery>()
     private val peerNotices = mutableMapOf<String, String>()
     private var campaignQuests = RpgQuestStorage.load(appContext, RpgQuestStorage.campaignKey(roomId))
+    private var combat = CombatStorage.load(appContext, roomId)
     private var activeMapId = ""
+    // Published map is independent from the host's currently edited preview.
+    private var publishedMapId = ""
+    // When the master retracts a published map, guests see the waiting room.
+    private var mapInPreparation = false
     private var permissions = LanPermissions(skillTreeEnabled = appContext
         .getSharedPreferences("rpg_lan_cache", Context.MODE_PRIVATE)
         .getBoolean("campaign_skill_tree_enabled", true))
@@ -233,17 +296,16 @@ internal class LanSession(
         LanRoomStorage.saveRoomMarkers(appContext, roomId, id,
             synchronized(lock) { markerSets[id]?.values?.toList() ?: emptyList() })
         log("Мастер", "Добавил карту «${map.info.name}»")
-        switchMap(id, broadcastChange = false)
-        // Enqueue the image before the switch: all clients must receive the image first.
+        // Adding a map never forcibly teleports players from their current adventure.
+        previewMap(id)
+        // Send the new image and its contents, but keep their published map.
         val packet = mapPacket(map)
-        val selectedPacket = JSONObject().put("type", "map_select").put("id", id).toString()
         val selectedMarkers = markersMessage(id)
         val selectedFog = fogPacket(id)
         broadcast.execute {
             peers.forEach { peer -> try {
                 peer.send(packet)
-                peer.send(selectedPacket)
-                peer.send(selectedMarkers)
+                peer.send(markersMessage(id, peer.id))
                 peer.send(selectedFog)
             } catch (_: Exception) {} }
             publishPlayers()
@@ -251,35 +313,94 @@ internal class LanSession(
         return true
     }
 
-    /** Switch the whole room to an already uploaded map. */
+    /** Show a map ONLY to the host. Player map, positions, and camera are unchanged. */
+    fun previewMap(id: String): Boolean {
+        if (!hostMode || closed) return false
+        synchronized(lock) {
+            val target = roomMaps[id] ?: return false
+            activeMapId = id
+            update { it.copy(activeMapId = id, roomId = roomId, mapName = target.info.name,
+                image = target.bytes, roomMaps = roomMaps.values.map { map -> map.info },
+                roomMarkers = markerSnapshots(), markers = markers.values.toList(),
+                fog = fogByMap[id] ?: LanFog()) }
+        }
+        return true
+    }
+
+    /** Explicit publication is the only action that moves all players to this map. */
+    fun publishPreparedMap(): Boolean = switchMap(synchronized(lock) { activeMapId })
+
+    fun isPreparingMap(): Boolean = hostMode && synchronized(lock) {
+        mapInPreparation || activeMapId != publishedMapId
+    }
+
+    /** Hide the currently published map while the host prepares it. No markers/fog are deleted. */
+    fun returnMapToPreparation(): Boolean {
+        if (!hostMode || closed) return false
+        synchronized(lock) {
+            if (publishedMapId.isBlank()) return false
+            // Preserve each guest's exact last position before suspending map access.
+            players.keys.forEach { id ->
+                players[id]?.let { player ->
+                    if (player.mapId.isNotBlank()) {
+                        positions.getOrPut(player.mapId) { linkedMapOf() }[id] = player.x to player.y
+                        rememberGuestPosition(id, player.mapId, player.x, player.y, force = true)
+                    }
+                }
+            }
+            publishedMapId = ""
+            mapInPreparation = true
+            players.keys.toList().forEach { id ->
+                players[id]?.let { players[id] = it.copy(mapId = "") }
+            }
+        }
+        log("Мастер", "Убрал карту в подготовку")
+        val packet = JSONObject().put("type", "map_hold").toString()
+        broadcast.execute {
+            peers.forEach { peer -> try { peer.send(packet) } catch (_: Exception) {} }
+            publishPlayers()
+        }
+        return true
+    }
+
     fun switchMap(id: String, broadcastChange: Boolean = true): Boolean {
         if (!hostMode || closed) return false
         val target: RoomMap
         synchronized(lock) {
             target = roomMaps[id] ?: return false
-            if (activeMapId == id) return true
+            if (activeMapId == id && (!broadcastChange || publishedMapId == id)) return true
             activeMapId = id
-            conversation = null
-            players.keys.toList().forEach { playerId ->
-                val player = players[playerId] ?: return@forEach
-                val location = positions[id]?.get(playerId) ?: (0.5f to 0.5f)
-                players[playerId] = player.copy(x = location.first, y = location.second, mapId = id)
+            if (broadcastChange) {
+                publishedMapId = id
+                mapInPreparation = false
+                conversation = null
+                players.keys.toList().forEach { playerId ->
+                    val player = players[playerId] ?: return@forEach
+                    val identity = guestIdentities[playerId]
+                    val remembered = identity?.let { LanRoomStorage.loadPlayerPosition(appContext, roomId, it, id) }
+                    val destination = positions[id]?.get(playerId) ?: remembered ?: (0.5f to 0.5f)
+                    players[playerId] = player.copy(x = destination.first, y = destination.second, mapId = id)
+                    rememberGuestPosition(playerId, id, destination.first, destination.second, force = true)
+                }
             }
             update { it.copy(activeMapId = id, roomId = roomId,
                 mapName = target.info.name, image = target.bytes,
                 roomMaps = roomMaps.values.map { map -> map.info },
                 roomMarkers = markerSnapshots(), markers = markers.values.toList(),
-                players = players.values.toList(), fog = fogByMap[id] ?: LanFog(), conversation = null) }
+                players = players.values.toList(), fog = fogByMap[id] ?: LanFog(),
+                conversation = if (broadcastChange) null else it.conversation) }
         }
-        log("Мастер", "Открыл карту «${target.info.name}»")
         if (broadcastChange) {
+            log("Мастер", "Опубликовал карту «${target.info.name}»")
             val selection = JSONObject().put("type", "map_select").put("id", id).toString()
             val closedDialog = conversationPacket(null)
             val markerData = markersMessage(id)
             val fogData = fogPacket(id)
             broadcast.execute {
-            peers.forEach { peer -> try { peer.send(selection); peer.send(markerData); peer.send(fogData); peer.send(closedDialog) } catch (_: Exception) {} }
-            publishPlayers()
+                peers.forEach { peer -> try {
+                    peer.send(selection); peer.send(markersMessage(id, peer.id)); peer.send(fogData); peer.send(closedDialog)
+                } catch (_: Exception) {} }
+                publishPlayers()
             }
         }
         return true
@@ -289,6 +410,7 @@ internal class LanSession(
     fun removeMap(id: String): Boolean {
         if (!hostMode || closed || !state.connected) return false
         val removedName: String
+        var removedPublished = false
         val nextId: String
         val currentMarkers: List<LanMarker>
         synchronized(lock) {
@@ -297,12 +419,15 @@ internal class LanSession(
             markerSets.remove(id)
             fogByMap.remove(id)
             positions.remove(id)
-            if (activeMapId == id) {
-                activeMapId = roomMaps.keys.firstOrNull().orEmpty()
+            removedPublished = publishedMapId == id
+            if (removedPublished) publishedMapId = roomMaps.keys.firstOrNull().orEmpty()
+            if (activeMapId == id) activeMapId = publishedMapId
+            if (removedPublished) {
                 players.keys.toList().forEach { playerId ->
                     val player = players[playerId] ?: return@forEach
-                    val (x, y) = positions[activeMapId]?.get(playerId) ?: (0.5f to 0.5f)
-                    players[playerId] = player.copy(x = x, y = y, mapId = activeMapId)
+                    val destination = publishedMapId
+                    val (x, y) = positions[destination]?.get(playerId) ?: (0.5f to 0.5f)
+                    players[playerId] = player.copy(x = x, y = y, mapId = destination)
                 }
             }
             nextId = activeMapId
@@ -321,12 +446,12 @@ internal class LanSession(
         }
         log("Мастер", "Убрал карту «$removedName» из комнаты")
         val packet = JSONObject().put("type", "room_map_remove")
-            .put("id", id).put("activeId", nextId).toString()
+            .put("id", id).put("activeId", if (removedName.isNotBlank() && removedPublished) publishedMapId else "").toString()
         val selectedMarkers = if (nextId.isNotBlank()) markersMessage(nextId) else null
         broadcast.execute {
             peers.forEach { peer -> try {
                 peer.send(packet)
-                if (selectedMarkers != null) peer.send(selectedMarkers)
+                if (selectedMarkers != null) peer.send(markersMessage(nextId, peer.id))
             } catch (_: Exception) {} }
             publishPlayers()
         }
@@ -441,6 +566,140 @@ internal class LanSession(
         } }
     }
 
+    private fun combatPacket(): String = JSONObject().put("type", "combat_state")
+        .put("combat", CombatStorage.encode(combat, includePrivateIdentity = false)).toString()
+
+    private fun publishCombat() {
+        if (!hostMode || closed) return
+        val snapshot = synchronized(lock) { combat }
+        CombatStorage.save(appContext, roomId, snapshot)
+        update { it.copy(combat = snapshot) }
+        val packet = JSONObject().put("type", "combat_state")
+            .put("combat", CombatStorage.encode(snapshot, includePrivateIdentity = false)).toString()
+        broadcast.execute { if (!closed) peers.forEach { peer ->
+            try { peer.send(packet) } catch (_: Exception) {}
+        } }
+    }
+
+    private fun changeCombat(transform: (CombatState) -> CombatState) {
+        if (!hostMode || closed || !state.connected) return
+        val changed = synchronized(lock) {
+            val next = transform(combat)
+            if (next == combat) false else {
+                combat = next.copy(revision = combat.revision + 1)
+                true
+            }
+        }
+        if (changed) publishCombat()
+    }
+
+    private fun playerInitiativeBonus(playerId: String): Int {
+        val sheet = runCatching { JSONObject(snapshots[playerId] ?: "{}") }.getOrDefault(JSONObject())
+        val dexterity = sheet.optJSONObject("attributes")?.optInt("Ловкость", 10) ?: 10
+        val dexMod = Math.floorDiv(dexterity.coerceIn(1, 99) - 10, 2)
+        return (dexMod + sheet.optInt("initiativeBonus", 0)).coerceIn(-99, 99)
+    }
+
+    fun prepareCombat() {
+        changeCombat { _ ->
+            var result = CombatEngine.setup()
+            players.values.forEach { player ->
+                result = CombatEngine.add(result, CombatFighter("player:${guestIdentities[player.id] ?: player.id}",
+                    player.name, "player", player.id, guestIdentities[player.id].orEmpty(),
+                    initiativeBonus = playerInitiativeBonus(player.id)))
+            }
+            result
+        }
+    }
+
+    fun addCombatPlayer(playerId: String) {
+        changeCombat { existing ->
+            val player = players[playerId] ?: return@changeCombat existing
+            val stable = guestIdentities[playerId] ?: playerId
+            CombatEngine.add(existing, CombatFighter("player:$stable", player.name, "player", playerId,
+                stable, initiativeBonus = playerInitiativeBonus(playerId)))
+        }
+    }
+
+    fun addCombatMarker(markerId: String) {
+        changeCombat { existing ->
+            val marker = markers[markerId] ?: return@changeCombat existing
+            CombatEngine.add(existing, CombatFighter("marker:${marker.id}", marker.name, "marker", marker.id))
+        }
+    }
+
+    fun addCombatCustom(name: String, bonus: Int) {
+        if (name.trim().isBlank()) return
+        changeCombat { existing -> CombatEngine.add(existing, CombatFighter("custom:${UUID.randomUUID()}",
+            name.trim().take(60), "custom", initiativeBonus = bonus.coerceIn(-99, 99))) }
+    }
+
+    fun removeCombatFighter(id: String) = changeCombat { CombatEngine.remove(it, id) }
+
+    fun masterCombatInitiative(id: String, roll: Int, bonus: Int? = null) {
+        changeCombat { current ->
+            val fighter = current.fighters.firstOrNull { it.id == id } ?: return@changeCombat current
+            val calculated = if (fighter.kind == "player") playerInitiativeBonus(fighter.sourceId)
+                else (bonus ?: fighter.initiativeBonus)
+            CombatEngine.initiative(current, id, roll, calculated)
+        }
+    }
+
+    fun startCombat() = changeCombat { CombatEngine.start(it) }
+    fun finishCombat() = changeCombat { CombatEngine.finish(it) }
+    fun nextCombatTurn() = changeCombat { CombatEngine.next(it) }
+    fun previousCombatTurn() = changeCombat { CombatEngine.previous(it) }
+    fun refundCombatAction() = changeCombat { CombatEngine.refund(it) }
+
+    fun combatCommand(action: String, roll: Int = 0, label: String = "", details: String = "") {
+        if (closed || !state.connected || action !in setOf("roll", "act", "next")) return
+        val packet = JSONObject().put("type", "combat_command").put("action", action)
+            .put("roll", roll).put("label", label.take(40)).put("details", details.take(90))
+        if (hostMode) return // Master uses explicit controls below.
+        val writer = outgoing ?: return
+        outbound.execute { try { synchronized(writer) {
+            writer.write(packet.toString()); writer.newLine(); writer.flush()
+        } } catch (_: Exception) {} }
+    }
+
+    fun masterCombatAction(label: String, details: String = "") {
+        changeCombat { existing -> CombatEngine.action(existing, existing.currentId, label, details) }
+    }
+
+    private fun receiveCombatCommand(actorId: String, command: JSONObject) {
+        if (!hostMode || actorId !in players) return
+        val action = command.optString("action")
+        changeCombat { existing ->
+            when (action) {
+                "roll" -> {
+                    val fighter = existing.fighters.firstOrNull { it.kind == "player" && it.sourceId == actorId }
+                        ?: return@changeCombat existing
+                    CombatEngine.initiative(existing, fighter.id, command.optInt("roll", 0),
+                        playerInitiativeBonus(actorId))
+                }
+                "act" -> {
+                    val fighter = existing.current ?: return@changeCombat existing
+                    if (fighter.kind != "player" || fighter.sourceId != actorId) existing
+                    else CombatEngine.action(existing, fighter.id, command.optString("label"),
+                        command.optString("details").take(90))
+                }
+                "next" -> {
+                    val fighter = existing.current ?: return@changeCombat existing
+                    if (fighter.kind == "player" && fighter.sourceId == actorId) CombatEngine.next(existing)
+                    else existing
+                }
+                else -> existing
+            }
+        }
+    }
+
+    private fun canPlayerMoveDuringCombat(playerId: String): Boolean {
+        if (combat.phase != "active") return true
+        val fighter = combat.fighters.firstOrNull { it.kind == "player" && it.sourceId == playerId }
+            ?: return true // A bystander is not part of combat.
+        return combat.currentId == fighter.id && fighter.movementAllowed
+    }
+
     fun sendEvent(action: String) {
         if (action.isBlank() || closed) return
         if (hostMode) { log("Мастер", action); return }
@@ -476,7 +735,7 @@ internal class LanSession(
     ): Boolean {
         if (!hostMode || closed || operation !in setOf(
                 "identity", "level", "grant_xp", "set_xp", "max_xp", "auto_xp", "attribute",
-                "item_save", "item_delete", "ability_save", "ability_delete", "equipment", "adventure_rest", "hero_story_pair",
+                "item_save", "item_delete", "ability_save", "ability_delete", "equipment", "adventure_rest", "hero_story_pair", "adjust_health",
                 "skill_points", "skill_reset", "skill_learn"
             )) return false
         val target: Peer
@@ -548,9 +807,55 @@ internal class LanSession(
                 playerRenamed = true
             }
         }
-        if (playerRenamed) broadcast.execute { if (!closed) publishPlayers() }
-        // Re-send durable, idempotent receipts after reconnect or a lost acknowledgement.
+        val newHp = current.optInt("health", -1).coerceAtLeast(-1)
+        val newMaxHp = current.optInt("healthMax", -1).coerceAtLeast(-1)
+        var vitalsChanged = false
+        synchronized(lock) {
+            val old = players[id]
+            if (old != null && (old.hp != newHp || old.maxHp != newMaxHp)) {
+                players[id] = old.copy(hp = newHp, maxHp = newMaxHp)
+                vitalsChanged = true
+            }
+        }
+        if (playerRenamed || vitalsChanged) broadcast.execute { if (!closed) publishPlayers() }
+        if (combat.phase == "setup") changeCombat { existing ->
+            val bonus = playerInitiativeBonus(id)
+            val updated = existing.fighters.map { fighter ->
+                if (fighter.kind == "player" && fighter.sourceId == id &&
+                    (fighter.initiativeBonus != bonus || fighter.name != nameFromCharacter && nameFromCharacter.isNotBlank()))
+                    fighter.copy(initiativeBonus = bonus,
+                        name = nameFromCharacter.takeIf { it.isNotBlank() } ?: fighter.name)
+                else fighter
+            }
+            if (updated == existing.fighters) existing else existing.copy(fighters = updated)
+        }
+        // Client coin adjustments are cumulative. Apply only the difference since the
+        // last snapshot processed for this campaign/character, never the entire wallet.
+        // The master remains authoritative for spending and shop inventory.
         val characterId = current.optLong("id", -1L)
+        if (characterId > 0L && current.has("walletLedgerCopper")) {
+            val newLedger = current.optLong("walletLedgerCopper", 0L)
+            var changed = false
+            if (newLedger in -RpgCurrency.MAX_COPPER..RpgCurrency.MAX_COPPER) synchronized(lock) {
+                val key = characterId.toString()
+                val oldLedger = adventure.walletLedgerCopper[key] ?: 0L
+                if (newLedger != oldLedger) {
+                    val goldDelta = newLedger / 100L - oldLedger / 100L
+                    val existing = (adventure.wallets[key] ?: 0).toLong()
+                    val next = (existing + goldDelta).coerceIn(0L, 1_000_000_000L).toInt()
+                    adventure = adventure.copy(
+                        wallets = adventure.wallets + (key to next),
+                        walletLedgerCopper = adventure.walletLedgerCopper + (key to newLedger)
+                    )
+                    changed = true
+                } else if (key !in adventure.wallets) {
+                    adventure = adventure.copy(wallets = adventure.wallets + (key to 0))
+                    changed = true
+                }
+            }
+            if (changed) publishAdventure()
+        }
+        // Re-send durable, idempotent receipts after reconnect or a lost acknowledgement.
         synchronized(lock) { adventure.pendingShop.filter { it.characterId == characterId } }
             .forEach { sendShopReceipt(id, it) }
         if (previous != null) {
@@ -590,6 +895,7 @@ internal class LanSession(
                 val id = "host"
                 synchronized(lock) {
                     activeMapId = mapId
+                    publishedMapId = mapId
                     roomMaps[mapId] = RoomMap(LanRoomMapInfo(mapId, mapName.take(80), localId), bytes)
                     val saved = LanRoomStorage.loadRoomMarkers(appContext, roomId, mapId)
                     fogByMap[mapId] = LanWorldStorage.loadFog(appContext, roomId, mapId)
@@ -606,6 +912,7 @@ internal class LanSession(
                     myId = id, mapName = mapName, image = bytes, activeMapId = mapId, roomId = roomId,
                     roomMaps = roomMaps.values.map { map -> map.info }, roomMarkers = markerSnapshots(),
                     markers = markers.values.toList(), players = players.values.toList(), permissions = permissions,
+                    combat = combat,
                     fog = fogByMap[mapId] ?: LanFog(), quests = campaignQuests, adventure = adventure) }
                 log("Мастер", "Создал комнату: $mapName")
                 while (!closed) {
@@ -621,6 +928,9 @@ internal class LanSession(
                             if (hello.optString("type") != "hello") throw IllegalStateException("Неверное приветствие")
                             val idClient = UUID.randomUUID().toString()
                             nameClient = hello.optString("name", "Игрок").trim().take(40).ifEmpty { "Игрок" }
+                            val stableIdentity = hello.optString("identity").take(100)
+                                .takeIf { it.matches(Regex("[a-zA-Z0-9_-]{1,100}")) }
+                                ?: UUID.randomUUID().toString()
                             val connectedPeer = Peer(socket, writer, idClient)
                             peer = connectedPeer
                             socket.soTimeout = 0
@@ -628,7 +938,7 @@ internal class LanSession(
                             val existingMaps = synchronized(lock) { roomMaps.values.toList() }
                             existingMaps.forEach { roomMap -> connectedPeer.send(mapPacket(roomMap)) }
                             existingMaps.forEach { roomMap ->
-                                connectedPeer.send(markersMessage(roomMap.info.id))
+                                connectedPeer.send(markersMessage(roomMap.info.id, connectedPeer.id))
                                 connectedPeer.send(fogPacket(roomMap.info.id))
                             }
                             synchronized(lock) {
@@ -640,18 +950,43 @@ internal class LanSession(
                                 }
                                 roomMaps.values.filter { it.info.id !in alreadySent }.forEach { roomMap ->
                                     connectedPeer.send(mapPacket(roomMap))
-                                    connectedPeer.send(markersMessage(roomMap.info.id))
+                                    connectedPeer.send(markersMessage(roomMap.info.id, connectedPeer.id))
                                     connectedPeer.send(fogPacket(roomMap.info.id))
                                 }
-                                connectedPeer.send(mapSelectionPacket())
+                                val savedMap = if (mapInPreparation) "" else
+                                    (LanRoomStorage.loadLastPlayerMap(appContext, roomId, stableIdentity)
+                                        .takeIf { it in roomMaps } ?: publishedMapId)
+                                val savedPos = LanRoomStorage.loadPlayerPosition(appContext, roomId, stableIdentity, savedMap)
+                                    ?: (0.5f to 0.5f)
+                                connectedPeer.send(JSONObject().put("type", if (savedMap.isBlank()) "map_hold" else "map_select")
+                                    .put("id", savedMap).toString())
                                 connectedPeer.send(JSONObject().put("type", "welcome").put("id", idClient).toString())
                                 connectedPeer.send(permissionMessage())
                                 connectedPeer.send(masterMovementPacket())
                                 connectedPeer.send(questsPacket(nameClient))
                                 connectedPeer.send(adventurePacket(idClient))
+                                // Reattach a fighter after a phone reconnects (stable character identity).
+                                if (combat.fighters.any { it.kind == "player" && it.stableIdentity == stableIdentity }) {
+                                    combat = combat.copy(fighters = combat.fighters.map { f ->
+                                        if (f.kind == "player" && f.stableIdentity == stableIdentity)
+                                            f.copy(sourceId = idClient, name = nameClient) else f
+                                    }, revision = combat.revision + 1)
+                                    broadcast.execute { publishCombat() }
+                                }
+                                connectedPeer.send(combatPacket())
                                 conversation?.let { connectedPeer.send(conversationPacketForPeer(it, idClient)) }
-                                players[idClient] = LanPlayer(idClient, nameClient, 0.5f, 0.5f, activeMapId)
+                                guestIdentities[idClient] = stableIdentity
+                                players[idClient] = LanPlayer(idClient, nameClient, savedPos.first, savedPos.second, savedMap)
+                                positions.getOrPut(savedMap) { linkedMapOf() }[idClient] = savedPos
                                 peers.add(connectedPeer)
+                                // Send personalized snapshots after the stable identity is registered.
+                                roomMaps.keys.forEach { mapId ->
+                                    connectedPeer.send(markersMessage(mapId, idClient))
+                                }
+                                if (savedMap.isNotBlank() && detectHiddenMarkers(idClient, savedMap,
+                                        savedPos.first, savedPos.second, savedPos.first, savedPos.second)) {
+                                    broadcast.execute { sendMarkersToAll(savedMap) }
+                                }
                             }
                             publishPlayers()
                             log(nameClient, "Подключился к комнате")
@@ -663,6 +998,7 @@ internal class LanSession(
                                 if (action == "marker_add" || action == "marker_update" || action == "marker_delete") {
                                     applyMarkerMessage(message, idClient, nameClient)
                                 }
+                                if (action == "combat_command") receiveCombatCommand(idClient, message)
                                 if (action == "character_snapshot") {
                                     receiveCharacterSnapshot(idClient, nameClient, message.optString("payload"))
                                 }
@@ -721,6 +1057,7 @@ internal class LanSession(
                                     val y = message.optDouble("y", Double.NaN)
                                     if (x.isFinite() && y.isFinite()) {
                                         synchronized(lock) {
+                                            if (!canPlayerMoveDuringCombat(idClient)) return@synchronized
                                             // Recheck under the same lock as host movement.
                                             if (masterMovingPlayerId == idClient) return@synchronized
                                             val old = players[idClient]
@@ -730,7 +1067,11 @@ internal class LanSession(
                                                 if (!fog.allowedPath(old.x, old.y, x.toFloat(), y.toFloat())) return@synchronized
                                                 val pos = x.toFloat().coerceIn(0f, 1f) to y.toFloat().coerceIn(0f, 1f)
                                                 players[idClient] = old.copy(x = pos.first, y = pos.second)
-                                                positions.getOrPut(old.mapId.ifBlank { activeMapId }) { linkedMapOf() }[idClient] = pos
+                                                if (detectHiddenMarkers(idClient, playerMapId, old.x, old.y, pos.first, pos.second)) {
+                                                    broadcast.execute { sendMarkersToAll(playerMapId) }
+                                                }
+                                                positions.getOrPut(playerMapId) { linkedMapOf() }[idClient] = pos
+                                                rememberGuestPosition(idClient, playerMapId, pos.first, pos.second)
                                             }
                                         }
                                         publishPlayers()
@@ -741,7 +1082,19 @@ internal class LanSession(
                         } finally {
                             peer?.let {
                                 synchronized(lock) {
+                                    players[it.id]?.let { player ->
+                                        rememberGuestPosition(it.id, player.mapId, player.x, player.y, force = true)
+                                    }
                                     peers.remove(it); players.remove(it.id); snapshots.remove(it.id)
+                                    if (combat.fighters.any { f -> f.kind == "player" && f.sourceId == it.id }) {
+                                        combat = combat.copy(fighters = combat.fighters.map { f ->
+                                            if (f.kind == "player" && f.sourceId == it.id) f.copy(sourceId = "") else f
+                                        }, revision = combat.revision + 1)
+                                        broadcast.execute { publishCombat() }
+                                    }
+                                    guestIdentities.remove(it.id)
+                                    lastPositionSavedAt.keys.removeAll { key -> key.startsWith("${it.id}:") }
+                                    positions.values.forEach { map -> map.remove(it.id) }
                                     if (masterMovingPlayerId == it.id) masterMovingPlayerId = ""
                                     pendingEdits.entries.removeAll { entry -> entry.value.first == it.id }
                                     openChests.remove(it.id)
@@ -774,7 +1127,7 @@ internal class LanSession(
         }.start()
     }
 
-    fun join(ip: String, name: String) {
+    fun join(ip: String, name: String, characterId: Long = 0L) {
         Thread {
             try {
                 val socket = wifiSocketOrDefault()
@@ -785,7 +1138,8 @@ internal class LanSession(
                 val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
                 outgoing = writer
                 synchronized(writer) {
-                    writer.write(JSONObject().put("type", "hello").put("name", name.take(40)).toString())
+                    writer.write(JSONObject().put("type", "hello").put("name", name.take(40))
+                        .put("identity", LanRoomStorage.guestIdentity(appContext, characterId)).toString())
                     writer.newLine()
                     writer.flush()
                 }
@@ -794,6 +1148,10 @@ internal class LanSession(
                     val line = reader.readLine() ?: break
                     val message = JSONObject(line)
                     when (message.optString("type")) {
+                        "combat_state" -> {
+                            val incoming = CombatStorage.decode(message.optJSONObject("combat") ?: JSONObject())
+                            update { old -> if (incoming.revision >= old.combat.revision) old.copy(combat = incoming) else old }
+                        }
                         "room_map" -> {
                             val bytes = Base64.decode(message.getString("image"), Base64.DEFAULT)
                             if (bytes.isEmpty() || bytes.size > LAN_MAX_IMAGE) throw IllegalStateException("Карта слишком большая или пустая")
@@ -835,6 +1193,12 @@ internal class LanSession(
                                 roomMarkers = synchronized(lock) { markerSnapshots() },
                                 markers = nextMarkers, fog = synchronized(lock) { fogByMap[nextId] ?: LanFog() }
                             ) }
+                        }
+                        "map_hold" -> {
+                            synchronized(lock) { activeMapId = "" }
+                            update { it.copy(activeMapId = "", image = null,
+                                mapName = "Ожидание мастера", markers = emptyList(),
+                                conversation = null) }
                         }
                         "map_select" -> {
                             val id = message.optString("id")
@@ -904,10 +1268,7 @@ internal class LanSession(
                             if (mapId.isBlank() || synchronized(lock) { mapId !in roomMaps }) continue
                             val list = (0 until array.length()).map { index ->
                                 val item = array.getJSONObject(index)
-                                LanMarker(item.getString("id"), item.getString("name"),
-                                    item.optString("description"), item.optString("markerType", "Обычная"),
-                                    item.getDouble("x").toFloat(), item.getDouble("y").toFloat(),
-                                    item.optString("ownerId", "host"))
+                                readMarker(item)
                             }
                             synchronized(lock) { markerSets[mapId] = linkedMapOf<String, LanMarker>().apply {
                                 list.forEach { put(it.id, it) }
@@ -922,7 +1283,7 @@ internal class LanSession(
                             val array = message.getJSONArray("list")
                             val list = (0 until array.length()).map { index ->
                                 val item = array.getJSONObject(index)
-                                LanPlayer(item.getString("id"), item.getString("name"), item.getDouble("x").toFloat(), item.getDouble("y").toFloat(), item.optString("mapId", activeMapId))
+                                LanPlayer(item.getString("id"), item.getString("name"), item.getDouble("x").toFloat(), item.getDouble("y").toFloat(), item.optString("mapId", activeMapId), item.optInt("hp", -1), item.optInt("maxHp", -1))
                             }
                             update { it.copy(players = list) }
                         }
@@ -949,17 +1310,92 @@ internal class LanSession(
         }.start()
     }
 
-    private fun markersMessage(mapId: String = activeMapId): String {
+    private fun markerJson(marker: LanMarker): JSONObject = JSONObject()
+        .put("id", marker.id).put("name", marker.name)
+        .put("description", marker.description).put("markerType", marker.type)
+        .put("x", marker.x.toDouble()).put("y", marker.y.toDouble())
+        .put("ownerId", marker.ownerId).put("hp", marker.hp).put("maxHp", marker.maxHp)
+        .put("hidden", marker.hidden).put("revealMode", marker.revealMode)
+        .put("revealShape", marker.revealShape)
+        .put("revealRadiusX", marker.revealRadiusX.toDouble()).put("revealRadiusY", marker.revealRadiusY.toDouble())
+        .put("revealTo", marker.revealTo).put("revealedAll", marker.revealedAll)
+        .put("revealedFor", JSONArray(marker.revealedFor.toList()))
+
+    private fun readMarker(item: JSONObject): LanMarker {
+        val type = item.optString("markerType", "Обычная")
+        val revealed = item.optJSONArray("revealedFor")
+        return LanMarker(item.getString("id"), item.getString("name"),
+            item.optString("description"), type,
+            item.getDouble("x").toFloat(), item.getDouble("y").toFloat(),
+            item.optString("ownerId", "host"), item.optInt("hp", -1), item.optInt("maxHp", -1),
+            item.optBoolean("hidden", false), item.optString("revealMode", "zone"),
+            item.optString("revealShape", "circle"),
+            item.optDouble("revealRadiusX", 0.035).toFloat().coerceIn(0.005f, 1f),
+            item.optDouble("revealRadiusY", 0.035).toFloat().coerceIn(0.005f, 1f),
+            item.optString("revealTo", "all"), item.optBoolean("revealedAll", false),
+            if (revealed == null) emptySet() else (0 until revealed.length()).map { revealed.optString(it) }.toSet())
+    }
+
+    private fun canSeeMarker(marker: LanMarker, stableId: String?): Boolean =
+        !marker.hidden || marker.revealedAll || (stableId != null && stableId in marker.revealedFor)
+
+    // A hidden marker is never transferred over LAN until that recipient discovers it.
+    private fun markersMessage(mapId: String = activeMapId, peerId: String? = null): String {
         val array = JSONArray()
         synchronized(lock) {
+            val stableId = peerId?.let { guestIdentities[it] }
             markerSets[mapId]?.values?.forEach { marker ->
-                array.put(JSONObject().put("id", marker.id).put("name", marker.name)
-                    .put("description", marker.description).put("markerType", marker.type)
-                    .put("x", marker.x.toDouble()).put("y", marker.y.toDouble())
-                    .put("ownerId", marker.ownerId))
+                if (peerId == null || canSeeMarker(marker, stableId)) array.put(markerJson(marker))
             }
         }
         return JSONObject().put("type", "markers").put("mapId", mapId).put("list", array).toString()
+    }
+
+    private fun sendMarkersToAll(mapId: String) {
+        peers.forEach { peer -> try { peer.send(markersMessage(mapId, peer.id)) } catch (_: Exception) {} }
+    }
+
+    /** Host-authoritative discovery, persistent even after guests reconnect. */
+    private fun detectHiddenMarkers(playerId: String, mapId: String,
+                                    oldX: Float, oldY: Float, x: Float, y: Float): Boolean {
+        val identity = guestIdentities[playerId] ?: return false
+        val mapMarkers = markerSets[mapId] ?: return false
+        var changed = false
+        for ((id, marker) in mapMarkers.toList()) {
+            if (!marker.hidden || marker.revealMode == "manual" ||
+                (marker.revealTo == "all" && marker.revealedAll) ||
+                (marker.revealTo == "one" && identity in marker.revealedFor)) continue
+            // Fog check at discovery, not only at rendering: don't reveal unseen traps.
+            val fog = fogByMap[mapId] ?: LanFog()
+            if (!fog.visible(marker.x, marker.y)) continue
+            val hit = if (marker.revealMode == "touch")
+                lanMarkerTriggerHit(marker.copy(revealRadiusX = 0.009f, revealRadiusY = 0.009f), oldX, oldY, x, y)
+                else lanMarkerTriggerHit(marker, oldX, oldY, x, y)
+            if (!hit) continue
+            mapMarkers[id] = if (marker.revealTo == "one")
+                marker.copy(revealedFor = marker.revealedFor + identity)
+                else marker.copy(revealedAll = true)
+            changed = true
+        }
+        if (changed) {
+            LanRoomStorage.saveRoomMarkers(appContext, roomId, mapId, mapMarkers.values.toList())
+            update { it.copy(roomMarkers = markerSnapshots(),
+                markers = if (it.activeMapId == mapId) mapMarkers.values.toList() else it.markers) }
+        }
+        return changed
+    }
+
+    fun setMarkerDiscovery(id: String, mapId: String, reveal: Boolean) {
+        if (!hostMode || mapId.isBlank()) return
+        synchronized(lock) {
+            val original = markerSets[mapId]?.get(id) ?: return
+            markerSets[mapId]?.set(id, original.copy(revealedAll = reveal,
+                revealedFor = if (reveal) original.revealedFor else emptySet()))
+            LanRoomStorage.saveRoomMarkers(appContext, roomId, mapId, markerSets[mapId]!!.values.toList())
+            update { it.copy(markers = if (it.activeMapId == mapId) markerSets[mapId]!!.values.toList() else it.markers,
+                roomMarkers = markerSnapshots()) }
+        }
+        broadcast.execute { sendMarkersToAll(mapId) }
     }
 
     private fun applyMarkerMessage(message: JSONObject, senderId: String = "host", senderName: String = "Мастер") {
@@ -1004,7 +1440,17 @@ internal class LanSession(
                         markers[id] = LanMarker(id, name,
                             message.optString("description").take(1000),
                             markerType,
-                            x.toFloat().coerceIn(0f, 1f), y.toFloat().coerceIn(0f, 1f), owner)
+                            x.toFloat().coerceIn(0f, 1f), y.toFloat().coerceIn(0f, 1f), owner,
+                            if (senderId == "host") message.optInt("hp", old?.hp ?: -1).coerceIn(-1, 100000) else old?.hp ?: -1,
+                            if (senderId == "host") message.optInt("maxHp", old?.maxHp ?: -1).coerceIn(-1, 100000) else old?.maxHp ?: -1,
+                            if (senderId == "host") message.optBoolean("hidden", old?.hidden ?: false) else old?.hidden ?: false,
+                            if (senderId == "host") message.optString("revealMode", old?.revealMode ?: "zone").takeIf { it in setOf("zone", "touch", "manual") } ?: "zone" else old?.revealMode ?: "zone",
+                            if (senderId == "host") message.optString("revealShape", old?.revealShape ?: "circle").takeIf { it in setOf("circle", "rect") } ?: "circle" else old?.revealShape ?: "circle",
+                            if (senderId == "host") message.optDouble("revealRadiusX", old?.revealRadiusX?.toDouble() ?: 0.035).toFloat().coerceIn(0.005f, 1f) else old?.revealRadiusX ?: 0.035f,
+                            if (senderId == "host") message.optDouble("revealRadiusY", old?.revealRadiusY?.toDouble() ?: 0.035).toFloat().coerceIn(0.005f, 1f) else old?.revealRadiusY ?: 0.035f,
+                            if (senderId == "host") message.optString("revealTo", old?.revealTo ?: "all").takeIf { it in setOf("all", "one") } ?: "all" else old?.revealTo ?: "all",
+                            if (senderId == "host") message.optBoolean("revealedAll", old?.revealedAll ?: false) else old?.revealedAll ?: false,
+                            old?.revealedFor ?: emptySet())
                         accepted = true
                         if (action == "marker_add") {
                         event = "Создал метку «$name»"
@@ -1028,7 +1474,7 @@ internal class LanSession(
         val serialized = markersMessage(affectedMapId)
         broadcast.execute {
             LanRoomStorage.saveRoomMarkers(appContext, roomId, affectedMapId, snapshot)
-            peers.forEach { peer -> try { peer.send(serialized) } catch (_: Exception) {} }
+            sendMarkersToAll(affectedMapId)
         }
     }
 
@@ -1036,6 +1482,11 @@ internal class LanSession(
         val message = JSONObject().put("type", "marker_add").put("id", marker.id)
             .put("name", marker.name).put("description", marker.description)
             .put("markerType", marker.type).put("x", marker.x.toDouble()).put("y", marker.y.toDouble())
+            .put("hp", marker.hp).put("maxHp", marker.maxHp)
+            .put("hidden", marker.hidden).put("revealMode", marker.revealMode)
+            .put("revealShape", marker.revealShape)
+            .put("revealRadiusX", marker.revealRadiusX.toDouble()).put("revealRadiusY", marker.revealRadiusY.toDouble())
+            .put("revealTo", marker.revealTo).put("revealedAll", marker.revealedAll)
         sendMarker(message)
     }
 
@@ -1043,6 +1494,11 @@ internal class LanSession(
         val message = JSONObject().put("type", "marker_update").put("id", marker.id)
             .put("name", marker.name).put("description", marker.description)
             .put("markerType", marker.type).put("x", marker.x.toDouble()).put("y", marker.y.toDouble())
+            .put("hp", marker.hp).put("maxHp", marker.maxHp)
+            .put("hidden", marker.hidden).put("revealMode", marker.revealMode)
+            .put("revealShape", marker.revealShape)
+            .put("revealRadiusX", marker.revealRadiusX.toDouble()).put("revealRadiusY", marker.revealRadiusY.toDouble())
+            .put("revealTo", marker.revealTo).put("revealedAll", marker.revealedAll)
         sendMarker(message)
     }
 
@@ -1075,7 +1531,7 @@ internal class LanSession(
         val list = JSONArray()
         snapshot.forEach { player ->
             list.put(JSONObject().put("id", player.id).put("name", player.name).put("x", player.x.toDouble()).put("y", player.y.toDouble())
-                .put("mapId", player.mapId))
+                .put("mapId", player.mapId).put("hp", player.hp).put("maxHp", player.maxHp))
         }
         val msg = JSONObject().put("type", "players").put("list", list).toString()
         peers.forEach { peer ->
@@ -1092,14 +1548,20 @@ internal class LanSession(
             val old = players[id] ?: return
             val pos = x.coerceIn(0f, 1f) to y.coerceIn(0f, 1f)
             players[id] = old.copy(x = pos.first, y = pos.second)
-            positions.getOrPut(old.mapId.ifBlank { activeMapId }) { linkedMapOf() }[id] = pos
+            val positionMap = old.mapId.ifBlank { activeMapId }
+            if (detectHiddenMarkers(id, positionMap, old.x, old.y, pos.first, pos.second))
+                broadcast.execute { sendMarkersToAll(positionMap) }
+            positions.getOrPut(positionMap) { linkedMapOf() }[id] = pos
+            rememberGuestPosition(id, positionMap, pos.first, pos.second)
         }
         update { it.copy(players = synchronized(lock) { players.values.toList() }) }
         broadcast.execute { if (!closed) publishPlayers() }
     }
 
     fun move(x: Float, y: Float) {
-        if (!state.connected || state.masterMovingPlayerId == state.myId) return
+        if (!state.connected || state.masterMovingPlayerId == state.myId ||
+            (state.combat.phase == "active" && state.combat.fighters.any { it.kind == "player" && it.sourceId == state.myId } &&
+             (state.combat.current?.sourceId != state.myId || state.combat.current?.movementAllowed != true))) return
         val px = x.coerceIn(0f, 1f)
         val py = y.coerceIn(0f, 1f)
         if (hostMode) {
@@ -1384,7 +1846,7 @@ internal class LanSession(
             markers = if (old.activeMapId == source.targetMapId) saved else old.markers
         ) }
         val packet = markersMessage(source.targetMapId)
-        broadcast.execute { peers.forEach { peer -> try { peer.send(packet) } catch (_: Exception) {} } }
+        broadcast.execute { sendMarkersToAll(source.targetMapId) }
         log("Мастер", "Создан обратный выход на карте «${roomMaps[source.targetMapId]?.info?.name}»")
     }
 
@@ -1402,11 +1864,14 @@ internal class LanSession(
             LanWorldStorage.saveFog(appContext, roomId, destination, safeArrival)
         }
         players[playerId] = player.copy(mapId = destination, x = x.coerceIn(0f, 1f), y = y.coerceIn(0f, 1f))
+        if (detectHiddenMarkers(playerId, destination, x, y, x, y))
+            broadcast.execute { sendMarkersToAll(destination) }
         positions.getOrPut(destination) { linkedMapOf() }[playerId] = x to y
+        rememberGuestPosition(playerId, destination, x, y, force = true)
         val peer = peers.firstOrNull { it.id == playerId } ?: return
         broadcast.execute { try {
             peer.send(JSONObject().put("type", "map_select").put("id", destination).toString())
-            peer.send(markersMessage(destination))
+            peer.send(markersMessage(destination, peer.id))
             peer.send(fogPacket(destination))
         } catch (_: Exception) {} }
     }
@@ -1621,7 +2086,7 @@ internal class LanSession(
                     markerSets.getOrPut(player.mapId) { linkedMapOf() }[id] = camp
                     adventure = adventure.copy(campMarkerId = id, campMapId = player.mapId, notice = "Лагерь разбит")
                     LanRoomStorage.saveRoomMarkers(appContext, roomId, player.mapId, markerSets[player.mapId]!!.values.toList())
-                    broadcast.execute { peers.forEach { try { it.send(markersMessage(player.mapId)) } catch (_: Exception) {} } }
+                    broadcast.execute { peers.forEach { try { it.send(markersMessage(player.mapId, it.id)) } catch (_: Exception) {} } }
                     update { it.copy(markers = if (it.activeMapId == player.mapId) markerSets[player.mapId]!!.values.toList() else it.markers,
                         roomMarkers = markerSnapshots()) }
                 }
@@ -1636,7 +2101,7 @@ internal class LanSession(
                     if (campMap.isNotBlank()) {
                         LanRoomStorage.saveRoomMarkers(appContext, roomId, campMap,
                             markerSets[campMap]?.values?.toList() ?: emptyList())
-                        broadcast.execute { peers.forEach { try { it.send(markersMessage(campMap)) } catch (_: Exception) {} } }
+                        broadcast.execute { peers.forEach { try { it.send(markersMessage(campMap, it.id)) } catch (_: Exception) {} } }
                     }
                     adventure = adventure.copy(day = adventure.day + 1, phase = "day",
                         campMarkerId = "", campMapId = "", scrollUses = emptyMap(),
@@ -1671,7 +2136,8 @@ internal class LanSession(
     }
 
     fun close() {
-        if (hostMode) AdventureStorage.save(appContext, roomId, adventure)
+        if (hostMode) { AdventureStorage.save(appContext, roomId, adventure)
+            CombatStorage.save(appContext, roomId, combat) }
         closed = true
         try { server?.close() } catch (_: Exception) {}
         try { client?.close() } catch (_: Exception) {}

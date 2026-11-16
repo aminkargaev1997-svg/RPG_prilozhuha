@@ -18,16 +18,18 @@ internal data class AdventureItem(
     val quantity: String = "1",
     val keyFor: String = "",
     val price: Int = 0,
-    val stock: Int = 1
+    val stock: Int = 1,
+    val effects: List<ItemEffect> = emptyList()
 ) {
     fun json(): JSONObject = JSONObject().put("id", id).put("name", name).put("description", description)
         .put("category", category).put("quantity", quantity).put("keyFor", keyFor)
-        .put("price", price).put("stock", stock)
+        .put("price", price).put("stock", stock).put("effects", ItemEffectEngine.toJson(effects))
     companion object {
         fun parse(o: JSONObject) = AdventureItem(o.optString("id"), o.optString("name"),
             o.optString("description"), o.optString("category", "Прочее"),
             o.optString("quantity", "1"), o.optString("keyFor"),
-            o.optInt("price", 0).coerceAtLeast(0), o.optInt("stock", 1).coerceAtLeast(0))
+            o.optInt("price", 0).coerceAtLeast(0), o.optInt("stock", 1).coerceAtLeast(0),
+            if (o.has("effects")) ItemEffectEngine.fromJson(o.optJSONArray("effects")) else ItemEffectEngine.template(o.optString("name")))
     }
 }
 
@@ -157,7 +159,9 @@ internal data class AdventureWorld(
     val openChestId: String = "", // view-only
     val wallets: Map<String, Int> = emptyMap(), // master-owned, keyed by stable character ID
     val pendingShop: List<AdventurePurchase> = emptyList(), // master-owned durable receipts
-    val openShopId: String = "" // view-only, accessible only to the shopping player
+    val openShopId: String = "", // view-only, accessible only to the shopping player
+    // Last processed client currency ledger, persisted per campaign for idempotent credit.
+    val walletLedgerCopper: Map<String, Long> = emptyMap()
 ) {
     fun json(viewer: String = "host", openedChest: String = "", openedShop: String = "", viewerCharacterId: Long = -1): JSONObject = JSONObject()
         .put("day", day).put("phase", phase).put("campMapId", campMapId).put("campMarkerId", campMarkerId)
@@ -172,6 +176,8 @@ internal data class AdventureWorld(
         .put("notice", notice).put("openChestId", openedChest).put("openShopId", openedShop)
         .put("wallets", JSONObject(if (viewer == "host") wallets
             else wallets.filterKeys { it == viewerCharacterId.toString() }))
+        .put("walletLedgerCopper", JSONObject(if (viewer == "host") walletLedgerCopper
+            else walletLedgerCopper.filterKeys { it == viewerCharacterId.toString() }))
         .put("pendingShop", JSONArray().apply {
             pendingShop.filter { viewer == "host" || it.characterId == viewerCharacterId }.forEach { put(it.json()) }
         })
@@ -185,6 +191,9 @@ internal data class AdventureWorld(
             val money = o.optJSONObject("wallets") ?: JSONObject()
             val wallets = mutableMapOf<String, Int>()
             money.keys().forEach { k -> wallets[k] = money.optInt(k, 0).coerceAtLeast(0) }
+            val ledgerData = o.optJSONObject("walletLedgerCopper") ?: JSONObject()
+            val ledger = mutableMapOf<String, Long>()
+            ledgerData.keys().forEach { k -> ledger[k] = ledgerData.optLong(k, 0L) }
             val receipts = o.optJSONArray("pendingShop") ?: JSONArray()
             return AdventureWorld(o.optInt("day", 1).coerceAtLeast(1), o.optString("phase", "day"),
                 o.optString("campMapId"), o.optString("campMarkerId"),
@@ -193,7 +202,7 @@ internal data class AdventureWorld(
                 o.optJSONObject("trade")?.let(AdventureTrade::parse), counts,
                 strings(o.optJSONArray("heroStories")), o.optString("notice"), o.optString("openChestId"),
                 wallets, (0 until receipts.length()).mapNotNull { i -> receipts.optJSONObject(i)?.let(AdventurePurchase::parse) },
-                o.optString("openShopId"))
+                o.optString("openShopId"), ledger)
         }
     }
 }
@@ -236,7 +245,7 @@ internal object AdventureDelivery {
                     InventoryItem(name = record.name.take(100),
                         description = record.description.take(500) +
                             if (record.keyFor.isNotBlank()) " [KEY:${record.keyFor}]" else "",
-                        category = record.category.take(60), quantity = record.quantity.take(60))
+                        category = record.category.take(60), quantity = record.quantity.take(60), effects = record.effects)
                 })
         }
         val next = when (operation) {
@@ -245,7 +254,7 @@ internal object AdventureDelivery {
                 val record = AdventureItem.parse(data)
                 previous + InventoryItem(name = record.name.take(100), description = record.description.take(500) +
                     if (record.keyFor.isNotBlank()) " [KEY:${record.keyFor}]" else "",
-                    category = record.category.take(60), quantity = record.quantity.take(60))
+                    category = record.category.take(60), quantity = record.quantity.take(60), effects = record.effects)
             }
             "replace" -> {
                 val expected = packet.optJSONArray("expectedIds") ?: return false
@@ -255,7 +264,8 @@ internal object AdventureDelivery {
                 (0 until items.length()).mapNotNull { index -> items.optJSONObject(index)?.let { obj ->
                     InventoryItem(id = obj.optLong("id", System.nanoTime()), name = obj.optString("name"),
                         quantity = obj.optString("quantity"), description = obj.optString("description"),
-                        category = obj.optString("category", "Прочее"))
+                        category = obj.optString("category", "Прочее"),
+                        effects = if (obj.has("effects")) ItemEffectEngine.fromJson(obj.optJSONArray("effects")) else ItemEffectEngine.template(obj.optString("name")))
                 } }
             }
             else -> return false
@@ -272,13 +282,25 @@ internal object AdventureVitalsStorage {
     private fun prefs(context: Context) = context.getSharedPreferences("rpg_adventure_vitals", Context.MODE_PRIVATE)
     fun maxHealth(context: Context, characterId: Long): Int =
         prefs(context).getInt("max_$characterId", 100).coerceAtLeast(1)
+    fun effectiveMaxHealth(context: Context, characterId: Long): Int {
+        val inventory = CharacterStorage.loadInventory(context, characterId)
+        val slots = CharacterStorage.loadEquipment(context, characterId)
+        val bonus = ItemEffectEngine.total(inventory, slots).maxHpBonus
+        return (maxHealth(context, characterId).toLong() + bonus).coerceIn(1L, 99999L).toInt()
+    }
     fun currentHealth(context: Context, characterId: Long): Int =
-        prefs(context).getInt("current_$characterId", maxHealth(context, characterId))
+        prefs(context).getInt("current_$characterId", effectiveMaxHealth(context, characterId))
+            .coerceIn(0, effectiveMaxHealth(context, characterId))
     fun save(context: Context, characterId: Long, current: Int, maximum: Int) {
+        val equipmentBonus = ItemEffectEngine.total(
+            CharacterStorage.loadInventory(context, characterId),
+            CharacterStorage.loadEquipment(context, characterId)
+        ).maxHpBonus
+        val actualMaximum = (maximum.toLong() + equipmentBonus).coerceIn(1L, 99999L).toInt()
         prefs(context).edit().putInt("max_$characterId", maximum.coerceAtLeast(1))
-            .putInt("current_$characterId", current.coerceIn(0, maximum.coerceAtLeast(1))).apply()
+            .putInt("current_$characterId", current.coerceIn(0, actualMaximum)).apply()
     }
     fun fullRest(context: Context, characterId: Long) {
-        prefs(context).edit().putInt("current_$characterId", maxHealth(context, characterId)).apply()
+        prefs(context).edit().putInt("current_$characterId", effectiveMaxHealth(context, characterId)).apply()
     }
 }

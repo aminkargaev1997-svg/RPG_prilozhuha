@@ -34,6 +34,10 @@ fun CreateCharacterScreen(
     onCreate: (Character) -> Unit,
     character: Character? = null
 ) {
+    if (character == null) {
+        HeroCreationWizard(onBack = onBack, onCreate = onCreate)
+        return
+    }
     var characterName by remember(character?.id) {
         mutableStateOf(character?.name ?: "")
     }
@@ -103,6 +107,10 @@ fun CreateCharacterScreen(
             Text("📚 Выбрать класс из базы (${RpgCatalog.professions.size})")
         }
 
+        Spacer(modifier = Modifier.height(14.dp))
+        Text("Изменение расы или класса не заменяет уже выбранные стартовые способности. Их можно изменить во вкладке «Способности».",
+            style = androidx.compose.material3.MaterialTheme.typography.bodySmall)
+
         Spacer(modifier = Modifier.height(24.dp))
 
         Button(
@@ -119,7 +127,8 @@ fun CreateCharacterScreen(
                         experience = character?.experience ?: 0,
                         experienceRequired = character?.experienceRequired ?: experienceForLevel(1),
                         autoExperience = character?.autoExperience ?: true,
-                        prestigePoints = character?.prestigePoints ?: 0
+                        prestigePoints = character?.prestigePoints ?: 0,
+                        buildVersion = character?.buildVersion ?: 2
                     )
 
                     onCreate(updatedCharacter)

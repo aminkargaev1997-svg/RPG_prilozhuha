@@ -48,6 +48,7 @@ object SkillTreeEngine {
     }
 
     fun nodes(character: Character): List<TalentNode> {
+        if (character.buildVersion >= 2) return craftedNodes(character)
         val list = mutableListOf(TalentNode("root", "Начало пути", "Центральная точка дерева", TalentTier.SMALL, x = 0f, y = 0f))
         val sections = listOf(
             "Основы" to common,
@@ -88,17 +89,106 @@ object SkillTreeEngine {
         }
         return list
     }
-    fun totalPoints(character: Character, state: TalentState): Int =
-        (levelTreePoints(character.level).toLong() + character.prestigePoints + state.grantedPoints)
-            .coerceIn(0, Int.MAX_VALUE.toLong()).toInt()
+
+    /** Curated compact trees for new heroes; old v1 IDs remain untouched. */
+    private fun craftedNodes(character: Character): List<TalentNode> {
+        val classThemes = when (HeroCreationCatalog.classFamily(character.profession)) {
+            "следопыт" -> listOf("Путь разведчика", "Меткий выстрел", "Знаток природы")
+            "некромант" -> listOf("Могильные знания", "Защитный прах", "Диалог с тенью")
+            "ловкач" -> listOf("Искусство тени", "Взлом и тайны", "Ложный манёвр")
+            "хранитель" -> listOf("Оберег", "Клятва", "Свет исцеления")
+            "друид" -> listOf("Зелёный зов", "Травничество", "Дикий путь")
+            "маг" -> listOf("Рунное мастерство", "Защита чарами", "Поток магии")
+            "бард" -> listOf("Голос легенды", "Вдохновение", "Маски и роли")
+            "воин" -> listOf("Школа клинка", "Страж щита", "Выдержка")
+            "технолог" -> listOf("Схемы мира", "Полевой ремонт", "Мастер механики")
+            else -> listOf("Знание мира", "Ловкость пути", "Лидерство")
+        }
+        val raceThemes = when (HeroCreationCatalog.raceFamily(character.race)) {
+            "халфлинг" -> listOf("Удача малого народа", "Проворство")
+            "эльф" -> listOf("Древняя память", "Чутьё рощи")
+            "дворф" -> listOf("Каменная воля", "Знание ремесла")
+            "орк" -> listOf("Сила духа", "Дикая смекалка")
+            "демон" -> listOf("Пепельная стойкость", "Пламенная тайна")
+            "нежить" -> listOf("Эхо прошлого", "Могильная тишина")
+            "дракон" -> listOf("Драконье наследие", "Хранитель кладов")
+            "фея" -> listOf("Песня леса", "Загадки чар")
+            "море" -> listOf("Танец течений", "Голос глубины")
+            "механизм" -> listOf("Механическое чутьё", "Резервный привод")
+            "небесный" -> listOf("Свет надежды", "Долг хранителя")
+            "зверолюд" -> listOf("Охотничий инстинкт", "Сила стаи")
+            "растение" -> listOf("Живые корни", "Тихая роща")
+            else -> listOf("Родные традиции", "Зов открытий")
+        }
+        val branches = listOf("Общее" to "Путь искателя") +
+            raceThemes.map { "Раса" to it } + classThemes.map { "Класс" to it }
+        val result = mutableListOf(TalentNode("root", "Начало пути", "Выбери свой путь: общие, расовые и классовые направления.", TalentTier.SMALL))
+        branches.forEachIndexed { branchIndex, (kind, title) ->
+            val angle = -PI / 2 + branchIndex * 2 * PI / branches.size
+            var previous = "root"
+            for (step in 1..4) {
+                val tier = when (step) {
+                    1 -> TalentTier.SMALL
+                    2 -> TalentTier.NOTABLE
+                    3 -> TalentTier.KEYSTONE
+                    else -> TalentTier.LEGENDARY
+                }
+                // Small class/race attribute progress after 4th level; early traits remain situational.
+                val stat = if (step == 2) attributes[(branchIndex + 1) % attributes.size] else null
+                val text = when (step) {
+                    1 -> "Практика «$title»: +1 к одной тематической проверке по согласованию с мастером. Не добавляет +1 ко всем проверкам характеристики."
+                    2 -> "Постоянно +1 к характеристике «$stat». Бонус применяется автоматически, когда навык открыт."
+                    3 -> "Раз за игровой день: +2 к одной тематической проверке направления «$title» (решает мастер)."
+                    else -> "Легендарный приём «$title»: раз за игровой день можно повторить одну неудачную тематическую проверку. Второй результат обязателен."
+                }
+                val radius = 82f + step * 63f
+                val id = "v2_${kind}_${branchIndex}_$step"
+                result.add(TalentNode(id, when(step) {
+                    1 -> "$title · истоки"
+                    2 -> "$title · мастерство"
+                    3 -> "$title · особый приём"
+                    else -> "$title · легенда"
+                }, text, tier, stat, if (stat != null) 1 else 0,
+                    previous, (cos(angle) * radius).toFloat(), (sin(angle) * radius).toFloat(), "$kind · $title"))
+                previous = id
+            }
+        }
+        return result
+    }
+    /** Динамический лимит: цена всех изучаемых узлов (корень бесплатный). */
+    fun maxPoints(character: Character): Int =
+        nodes(character).asSequence().filter { it.id != "root" }.sumOf { it.tier.cost }
+
+    fun totalPoints(character: Character, state: TalentState): Int {
+        val earned = levelTreePoints(character.level, character.buildVersion).toLong() +
+            character.prestigePoints.toLong() + state.grantedPoints.toLong()
+        val limit = if (character.buildVersion >= 2) maxPoints(character).toLong()
+            else Int.MAX_VALUE.toLong()
+        return earned.coerceIn(0L, limit).toInt()
+    }
 
     fun spent(nodes: List<TalentNode>, state: TalentState): Int =
-        nodes.filter { it.id in state.unlocked }.sumOf { it.tier.cost }
+        nodes.filter { it.id != "root" && it.id in state.unlocked }.sumOf { it.tier.cost }
+
+    /** При переходе с v23 выученные узлы сохраняются, даже если потрачено больше нового бюджета. */
+    fun remainingPoints(character: Character, state: TalentState, nodes: List<TalentNode>): Int =
+        (totalPoints(character, state) - spent(nodes, state)).coerceAtLeast(0)
+
+    /** Бонус мастера ограничен суммарной стоимостью нового древа; у v1 правила прежние. */
+    fun adjustGrantedPoints(character: Character, state: TalentState, delta: Int): TalentState {
+        val maxGrant = if (character.buildVersion >= 2) {
+            (maxPoints(character).toLong() - levelTreePoints(character.level, character.buildVersion) -
+                character.prestigePoints.toLong()).coerceIn(-100_000L, 100_000L)
+        } else 100_000L
+        val next = (state.grantedPoints.toLong() + delta.toLong())
+            .coerceIn(-100_000L, maxGrant.coerceAtLeast(-100_000L)).toInt()
+        return state.copy(grantedPoints = next)
+    }
 
     fun canLearn(character: Character, state: TalentState, node: TalentNode, nodes: List<TalentNode>): Boolean =
         node.id != "root" && node.id !in state.unlocked && character.level >= node.tier.minLevel &&
             (node.parentId == "root" || node.parentId in state.unlocked) &&
-            totalPoints(character, state) - spent(nodes, state) >= node.tier.cost
+            remainingPoints(character, state, nodes) >= node.tier.cost
 
     fun learn(character: Character, state: TalentState, node: TalentNode, nodes: List<TalentNode>): TalentState =
         if (canLearn(character, state, node, nodes)) state.copy(unlocked = state.unlocked + node.id) else state

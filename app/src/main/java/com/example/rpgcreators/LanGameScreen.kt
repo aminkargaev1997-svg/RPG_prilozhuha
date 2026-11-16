@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -31,6 +32,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
@@ -64,7 +67,8 @@ fun LanGameScreen(
     characters: List<Character>,
     onBack: () -> Unit,
     isMaster: Boolean = false,
-    onCharacterUpdate: (Character) -> Unit = {}
+    onCharacterUpdate: (Character) -> Unit = {},
+    preselectedCharacterId: Long? = null
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -74,7 +78,14 @@ fun LanGameScreen(
     var selectedCharacterId by remember { mutableStateOf<Long?>(null) }
     var selectedMapId by remember { mutableStateOf(maps.firstOrNull()?.id) }
     var ip by remember { mutableStateOf("") }
-    var guestName by remember { mutableStateOf(characters.firstOrNull()?.name ?: "Игрок") }
+    val discovery = remember(context) { LanRoomDiscovery(context) }
+    var discoveredRooms by remember { mutableStateOf<List<DiscoveredLanRoom>>(emptyList()) }
+    var showManualIp by remember { mutableStateOf(false) }
+    var discoveringRooms by remember { mutableStateOf(true) }
+    val providedGuestCharacter = characters.firstOrNull { it.id == preselectedCharacterId }
+    var guestName by remember(preselectedCharacterId) {
+        mutableStateOf(providedGuestCharacter?.name ?: characters.firstOrNull()?.name ?: "Игрок")
+    }
     var mode by remember { mutableStateOf(if (isMaster) "host" else "guest") }
     var showPermissions by remember { mutableStateOf(false) }
     var showLogs by remember { mutableStateOf(false) }
@@ -85,6 +96,11 @@ fun LanGameScreen(
     var page by remember { mutableStateOf("map") }
     var journalReturnPage by remember { mutableStateOf("map") }
     var fullscreen by remember { mutableStateOf(false) }
+    var mapCombatExpanded by remember { mutableStateOf(false) }
+    var mapCombatDialog by remember { mutableStateOf(false) }
+    LaunchedEffect(fullscreen) {
+        if (!fullscreen) mapCombatDialog = false
+    }
     // Camera belongs to the viewport, not to world coordinates. All map children
     // (markers, players, fog) are drawn in the same local, unscaled map space.
     var cameraZoom by remember { mutableFloatStateOf(1f) }
@@ -99,6 +115,10 @@ fun LanGameScreen(
     var observingPlayerId by remember { mutableStateOf<String?>(null) }
     var observationTab by remember { mutableStateOf("character") }
     var selectedMarker by remember { mutableStateOf<LanMarker?>(null) }
+    var editingCreatureHealth by remember { mutableStateOf<LanMarker?>(null) }
+    var creatureMaxInput by remember { mutableStateOf("") }
+    var creatureCurrentInput by remember { mutableStateOf("") }
+
     var adventureEditor by remember { mutableStateOf<LanMarker?>(null) }
     var chestId by remember { mutableStateOf<String?>(null) }
     var shopId by remember { mutableStateOf<String?>(null) }
@@ -109,6 +129,9 @@ fun LanGameScreen(
     var heroStoryPlayerId by remember { mutableStateOf<String?>(null) }
     var adventureNotice by remember { mutableStateOf("") }
     var editMarker by remember { mutableStateOf<LanMarker?>(null) }
+    var detectionZoneEdit by remember { mutableStateOf<LanMarker?>(null) }
+    var zoneRadiusX by remember { mutableFloatStateOf(0.035f) }
+    var zoneRadiusY by remember { mutableFloatStateOf(0.035f) }
     var fogEditing by remember { mutableStateOf(false) }
     var fogErase by remember { mutableStateOf(true) }
     var lastFogBrushAt by remember { mutableLongStateOf(0L) }
@@ -118,6 +141,7 @@ fun LanGameScreen(
     var markerName by remember { mutableStateOf("") }
     var markerDescription by remember { mutableStateOf("") }
     var markerType by remember { mutableStateOf("Обычная") }
+    var markerHidden by remember { mutableStateOf(false) }
     var showMarkerCatalog by remember { mutableStateOf(false) }
     var mapBeingAdded by remember { mutableStateOf<Uri?>(null) }
     var newMapName by remember { mutableStateOf("") }
@@ -130,7 +154,9 @@ fun LanGameScreen(
     var mapForRoomRemoval by remember { mutableStateOf<LanRoomMapInfo?>(null) }
     var loadingMap by remember { mutableStateOf(false) }
     var mapError by remember { mutableStateOf<String?>(null) }
-    var selectedGuestCharacterId by remember { mutableStateOf(characters.firstOrNull()?.id) }
+    var selectedGuestCharacterId by remember(preselectedCharacterId) {
+        mutableStateOf(providedGuestCharacter?.id ?: characters.firstOrNull()?.id)
+    }
     val activeCharacter = characters.firstOrNull {
         it.id == (if (mode == "host") selectedCharacterId else selectedGuestCharacterId)
     }
@@ -188,21 +214,40 @@ fun LanGameScreen(
         while (current is ContextWrapper && current !is Activity) current = current.baseContext
         current as? Activity
     }
-    DisposableEffect(fullscreen, activity) {
-        val oldOrientation = activity?.requestedOrientation
-        val oldUi = activity?.window?.decorView?.systemUiVisibility
-        if (fullscreen) {
+    // The network map is the only landscape-only screen. Restoring portrait
+    // explicitly matters on devices with auto-rotate switched off.
+    DisposableEffect(fullscreen, page, activity) {
+        val view = activity?.window?.decorView
+        val previousUi = view?.systemUiVisibility
+        if (fullscreen && page == "map") {
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-            activity?.window?.decorView?.systemUiVisibility = (
+            view?.systemUiVisibility = (
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_FULLSCREEN
                     or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
             )
+        } else {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            view?.systemUiVisibility = 0
         }
         onDispose {
-            if (oldOrientation != null) activity?.requestedOrientation = oldOrientation
-            if (oldUi != null) activity?.window?.decorView?.systemUiVisibility = oldUi
+            // Returning from fullscreen or leaving LAN should never strand the
+            // ordinary character screens in landscape orientation.
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            view?.systemUiVisibility = if (fullscreen && page == "map") 0 else (previousUi ?: 0)
         }
     }
+    // Discovery is active only before joining; the master advertises while hosting.
+    DisposableEffect(discovery, started, mode, state.connected, discoveringRooms) {
+        if (mode == "host" && state.connected) {
+            discovery.advertise("RPG Creators — мастер")
+        } else if (mode != "host" && !started && discoveringRooms) {
+            discovery.discover { discoveredRooms = it }
+        } else {
+            discovery.stop()
+        }
+        onDispose { discovery.stop() }
+    }
+    DisposableEffect(discovery) { onDispose { discovery.stop() } }
     DisposableEffect(session) { onDispose { session.close() } }
 
     LaunchedEffect(state.adventure.notice) {
@@ -263,6 +308,22 @@ fun LanGameScreen(
             }
         }
     }
+    // Mirror purchases and master grants from the authoritative campaign wallet.
+    // Wait for the host to acknowledge the character's local currency ledger first,
+    // otherwise the initial empty wallet packet could overwrite pending coin deposits.
+    LaunchedEffect(state.adventure.wallets, state.adventure.walletLedgerCopper,
+        state.connected, activeCharacter?.id, isMaster) {
+        val id = activeCharacter?.id ?: return@LaunchedEffect
+        if (!isMaster && state.connected) {
+            val key = id.toString()
+            val hostGold = state.adventure.wallets[key] ?: return@LaunchedEffect
+            val hostLedger = state.adventure.walletLedgerCopper[key] ?: 0L
+            if (hostLedger == CharacterStorage.walletLedgerCopper(context, id)) {
+                CharacterStorage.mirrorHostWallet(context, id, hostGold)
+            }
+        }
+    }
+
     // Keep each player's most recently received campaign journal available offline.
     LaunchedEffect(state.questsVersion, state.roomId, activeCharacter?.id) {
         if (!isMaster && state.questsVersion > 0 && state.roomId.isNotBlank() && activeCharacter != null) {
@@ -309,15 +370,17 @@ fun LanGameScreen(
                         put("experience", latest.experience)
                         put("experienceRequired", latest.experienceRequired)
                         put("prestigePoints", latest.prestigePoints)
+                        put("initiativeBonus", DndSheetStorage.load(context, latest.id).initiativeBonus)
                         put("health", AdventureVitalsStorage.currentHealth(context, latest.id))
-                        put("healthMax", AdventureVitalsStorage.maxHealth(context, latest.id))
+                        put("healthMax", AdventureVitalsStorage.effectiveMaxHealth(context, latest.id))
                         val talentState = SkillTreeStorage.load(context, latest.id)
                         put("tree", JSONObject().put("nodes", JSONArray(talentState.unlocked.toList()))
                             .put("granted", talentState.grantedPoints))
                         put("inventory", JSONArray().apply {
                             CharacterStorage.loadInventory(context, latest.id).forEach { item ->
                                 put(JSONObject().put("id", item.id).put("name", item.name).put("quantity", item.quantity)
-                                    .put("description", item.description).put("category", item.category))
+                                    .put("description", item.description).put("category", item.category)
+                                    .put("effects", ItemEffectEngine.toJson(item.effects)))
                             }
                         })
                         put("abilities", JSONArray().apply {
@@ -325,7 +388,7 @@ fun LanGameScreen(
                                 put(JSONObject().put("id", ability.id).put("name", ability.name).put("description", ability.description)
                                     .put("activator", ability.activatorDescription)
                                     .put("passive", ability.passiveDescription).put("used", ability.isUsed)
-                                    .put("origin", ability.origin))
+                                    .put("origin", ability.origin).put("spellLevel", ability.spellLevel))
                             }
                         })
                         val allAttributes = linkedMapOf(
@@ -335,6 +398,7 @@ fun LanGameScreen(
                         allAttributes.putAll(CharacterStorage.loadAttributes(context, latest.id))
                         put("attributes", JSONObject(allAttributes))
                         put("equipment", JSONObject(CharacterStorage.loadEquipment(context, latest.id)))
+                        put("walletLedgerCopper", CharacterStorage.walletLedgerCopper(context, latest.id))
                     }.toString()
                     if (data != lastPayload) { session.sendCharacterSnapshot(data); lastPayload = data }
                 }
@@ -487,7 +551,8 @@ fun LanGameScreen(
             confirmButton = {
                 TextButton(enabled = (xpInput.toIntOrNull() ?: 0) > 0, onClick = {
                     val amount = xpInput.toIntOrNull() ?: 0
-                    val updated = activeCharacter.addExperience(amount)
+                    val updated = activeCharacter.addExperience(amount,
+                        SkillTreeStorage.load(context, activeCharacter.id).grantedPoints)
                     onCharacterUpdate(updated)
                     session.sendEvent("Получил $amount XP, уровень ${activeCharacter.level} → ${updated.level}")
                     xpInput = ""
@@ -665,12 +730,13 @@ fun LanGameScreen(
             })
     }
 
-    selectedPlayer?.let { player ->
+    selectedPlayer?.let { selection ->
+        val player = state.players.firstOrNull { it.id == selection.id } ?: selection
         AlertDialog(
             onDismissRequest = { selectedPlayer = null },
             title = { Text(player.name) },
             text = {
-                Column {
+                Column(Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState())) {
                     Text(if (player.id == state.myId) "Твой персонаж" else "Игрок в комнате")
                     if (!isMaster && player.id == state.myId) {
                         Text("Твой персонаж всегда управляется джойстиком на карте. Ничего включать не нужно.",
@@ -683,6 +749,35 @@ fun LanGameScreen(
                         } == true) {
                         TextButton(onClick = { tradeTargetId = player.id; selectedPlayer = null }) {
                             Text("⇄ Предложить обмен")
+                        }
+                    }
+                    if (player.maxHp > 0) {
+                        Text("Здоровье: ${player.hp.coerceIn(0, player.maxHp)}/${player.maxHp}",
+                            fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                    }
+                    if (isMaster && player.id != state.myId && player.maxHp > 0) {
+                        val charId = state.characterSnapshots.firstOrNull { it.ownerId == player.id }
+                            ?.let { runCatching { JSONObject(it.payload).optLong("id", -1L) }.getOrNull() } ?: -1L
+                        if (charId > 0L) {
+                            Text("Быстро изменить HP", fontSize = 12.sp)
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                listOf(-2, -5, -10, -15).forEach { amount ->
+                                    OutlinedButton(onClick = { session.editCharacterAsMaster(player.id, charId,
+                                        "adjust_health", JSONObject().put("delta", amount), "HP ${player.name}: $amount") },
+                                        modifier = Modifier.weight(1f), contentPadding = PaddingValues(0.dp)) {
+                                        Text("$amount", fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                listOf(2, 5, 10, 15).forEach { amount ->
+                                    OutlinedButton(onClick = { session.editCharacterAsMaster(player.id, charId,
+                                        "adjust_health", JSONObject().put("delta", amount), "HP ${player.name}: +$amount") },
+                                        modifier = Modifier.weight(1f), contentPadding = PaddingValues(0.dp)) {
+                                        Text("+$amount", fontSize = 11.sp)
+                                    }
+                                }
+                            }
                         }
                     }
                     if (isMaster && player.id != state.myId) {
@@ -771,21 +866,117 @@ fun LanGameScreen(
     editMarker?.let { marker ->
         var editedName by remember(marker.id) { mutableStateOf(marker.name) }
         var editedDescription by remember(marker.id) { mutableStateOf(marker.description) }
-        AlertDialog(onDismissRequest = { editMarker = null },
-            title = { Text("Редактор: ${marker.name}") },
-            text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(value = editedName, onValueChange = { editedName = it.take(80) }, label = { Text("Название") })
-                OutlinedTextField(value = editedDescription, onValueChange = { editedDescription = it.take(1000) },
-                    label = { Text("Текст для игроков") }, minLines = 3)
-            } },
-            confirmButton = { TextButton(enabled = editedName.isNotBlank(), onClick = {
-                session.updateMarker(marker.copy(name = editedName, description = editedDescription))
-                editMarker = null
-            }) { Text("Сохранить") } },
-            dismissButton = { TextButton(onClick = { editMarker = null }) { Text("Отмена") } })
+        var hidden by remember(marker.id) { mutableStateOf(marker.hidden) }
+        var revealMode by remember(marker.id) { mutableStateOf(marker.revealMode) }
+        var revealShape by remember(marker.id) { mutableStateOf(marker.revealShape) }
+        var revealTo by remember(marker.id) { mutableStateOf(marker.revealTo) }
+        var showDiscovery by remember(marker.id) { mutableStateOf(marker.hidden) }
+        val edited = marker.copy(name = editedName.trim(), description = editedDescription,
+            hidden = hidden, revealMode = revealMode, revealShape = revealShape,
+            revealTo = revealTo)
+        Dialog(onDismissRequest = { editMarker = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Surface(Modifier.fillMaxWidth(0.86f).fillMaxHeight(0.9f), shape = MaterialTheme.shapes.large) {
+                Column(Modifier.fillMaxSize().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Редактор: ${marker.name}", style = MaterialTheme.typography.titleMedium)
+                    Column(Modifier.weight(1f).verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                        OutlinedTextField(editedName, { editedName = it.take(80) },
+                            label = { Text("Название") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                        OutlinedTextField(editedDescription, { editedDescription = it.take(1000) },
+                            label = { Text("Описание") }, minLines = 2, modifier = Modifier.fillMaxWidth())
+                        HorizontalDivider()
+                        TextButton(onClick = { showDiscovery = !showDiscovery }) {
+                            Text(if (showDiscovery) "▾ Скрытность и обнаружение" else "▸ Скрытность и обнаружение")
+                        }
+                        if (showDiscovery) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(checked = hidden, onCheckedChange = { hidden = it })
+                                Text("Скрытая метка (видна мастеру)")
+                            }
+                            if (hidden) {
+                                Text("Когда раскрывать", style = MaterialTheme.typography.labelMedium)
+                                listOf("zone" to "Игрок входит в область", "touch" to "Игрок наступает на метку",
+                                    "manual" to "Только мастер вручную").forEach { (key, title) ->
+                                    Row(Modifier.fillMaxWidth().clickable { revealMode = key },
+                                        verticalAlignment = Alignment.CenterVertically) {
+                                        RadioButton(selected = revealMode == key, onClick = { revealMode = key })
+                                        Text(title, fontSize = 13.sp)
+                                    }
+                                }
+                                Text("Кому показывать", style = MaterialTheme.typography.labelMedium)
+                                listOf("all" to "Всей группе", "one" to "Только обнаружившему").forEach { (key, title) ->
+                                    Row(Modifier.fillMaxWidth().clickable { revealTo = key },
+                                        verticalAlignment = Alignment.CenterVertically) {
+                                        RadioButton(selected = revealTo == key, onClick = { revealTo = key })
+                                        Text(title, fontSize = 13.sp)
+                                    }
+                                }
+                                if (revealMode == "zone") {
+                                    Text("Форма области", style = MaterialTheme.typography.labelMedium)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        FilterChip(selected = revealShape == "circle", onClick = { revealShape = "circle" },
+                                            label = { Text("Круг") })
+                                        FilterChip(selected = revealShape == "rect", onClick = { revealShape = "rect" },
+                                            label = { Text("Прямоугольник") })
+                                    }
+                                    OutlinedButton(onClick = {
+                                        session.updateMarker(edited)
+                                        detectionZoneEdit = edited
+                                        zoneRadiusX = marker.revealRadiusX
+                                        zoneRadiusY = marker.revealRadiusY
+                                        editMarker = null
+                                    }, modifier = Modifier.fillMaxWidth()) { Text("◎ Нарисовать область на карте") }
+                                    Text("При настройке перетащи палец от центра метки к границе зоны.",
+                                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                OutlinedButton(onClick = {
+                                    session.updateMarker(edited.copy(revealedAll = true))
+                                    editMarker = null
+                                }, modifier = Modifier.fillMaxWidth()) { Text("Раскрыть всем сейчас") }
+                                OutlinedButton(onClick = {
+                                    session.updateMarker(edited.copy(revealedAll = false))
+                                    session.setMarkerDiscovery(marker.id, state.activeMapId, false)
+                                    editMarker = null
+                                }, modifier = Modifier.fillMaxWidth()) { Text("Снова скрыть (сброс обнаружения)") }
+                            }
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { editMarker = null }) { Text("Отмена") }
+                        Button(enabled = editedName.isNotBlank(), onClick = {
+                            session.updateMarker(edited)
+                            editMarker = null
+                        }) { Text("Сохранить") }
+                    }
+                }
+            }
+        }
     }
 
-    selectedMarker?.let { marker ->
+    editingCreatureHealth?.let { selected ->
+        val live = state.markers.firstOrNull { it.id == selected.id } ?: selected
+        AlertDialog(onDismissRequest = { editingCreatureHealth = null },
+            title = { Text("Точное здоровье: ${live.name}") },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(value = creatureCurrentInput,
+                    onValueChange = { creatureCurrentInput = it.filter(Char::isDigit).take(6) },
+                    label = { Text("Текущее HP") }, singleLine = true)
+                OutlinedTextField(value = creatureMaxInput,
+                    onValueChange = { creatureMaxInput = it.filter(Char::isDigit).take(6) },
+                    label = { Text("Максимальное HP") }, singleLine = true)
+            } },
+            confirmButton = { TextButton(onClick = {
+                val maximum = (creatureMaxInput.toIntOrNull() ?: 10).coerceIn(1, 100000)
+                val currentHp = (creatureCurrentInput.toIntOrNull() ?: maximum).coerceIn(0, maximum)
+                session.updateMarker(live.copy(hp = currentHp, maxHp = maximum))
+                editingCreatureHealth = null
+            }) { Text("Сохранить") } },
+            dismissButton = { TextButton(onClick = { editingCreatureHealth = null }) { Text("Отмена") } })
+    }
+
+    selectedMarker?.let { previousMarker ->
+        val marker = state.markers.firstOrNull { it.id == previousMarker.id } ?: previousMarker
         val isAdventureObject = marker.type in setOf("Сундук", "Дверь", "Дом", "Портал", "Магазин")
         val canMove = isMaster || (marker.ownerId == state.myId && state.permissions.moveOwnMarkers)
         val canDelete = isMaster || (marker.ownerId == state.myId && state.permissions.deleteOwnMarkers)
@@ -804,6 +995,41 @@ fun LanGameScreen(
                         Text(marker.description.ifBlank { "Тип: ${marker.type}" },
                             style = MaterialTheme.typography.bodyMedium)
                         HorizontalDivider()
+                        if (isMaster && marker.type !in setOf("Сундук", "Дверь", "Дом", "Магазин", "Портал", "Записка", "Лагерь")) {
+                            val maximum = marker.maxHp.takeIf { it > 0 } ?: 10
+                            val currentHp = marker.hp.takeIf { it >= 0 }?.coerceIn(0, maximum) ?: maximum
+                            Text("❤ $currentHp/$maximum HP", fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary)
+                            Text("Урон", fontSize = 12.sp)
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                listOf(2, 5, 10, 15).forEach { amount ->
+                                    OutlinedButton(onClick = {
+                                        session.updateMarker(marker.copy(hp = (currentHp - amount).coerceAtLeast(0), maxHp = maximum))
+                                    }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(0.dp)) {
+                                        Text("−$amount", fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                            Text("Лечение", fontSize = 12.sp)
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                listOf(2, 5, 10, 15).forEach { amount ->
+                                    OutlinedButton(onClick = {
+                                        session.updateMarker(marker.copy(hp = (currentHp + amount).coerceAtMost(maximum), maxHp = maximum))
+                                    }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(0.dp)) {
+                                        Text("+$amount", fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                            TextButton(onClick = {
+                                creatureMaxInput = maximum.toString()
+                                creatureCurrentInput = currentHp.toString()
+                                editingCreatureHealth = marker
+                                selectedMarker = null
+                            }) { Text("Задать точное HP и максимум") }
+                        } else if (marker.maxHp > 0) {
+                            Text("❤ ${marker.hp.coerceIn(0, marker.maxHp)}/${marker.maxHp} HP",
+                                fontWeight = FontWeight.Bold)
+                        }
                         if (marker.type == "NPC" || marker.type == "Толпа") {
                             val same = state.conversation?.markerId == marker.id
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -903,6 +1129,10 @@ fun LanGameScreen(
                         OutlinedButton(onClick = { showMarkerCatalog = true }, modifier = Modifier.fillMaxWidth()) {
                             Text("📚 База меток и противников", maxLines = 2)
                         }
+                        if (isMaster) Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = markerHidden, onCheckedChange = { markerHidden = it })
+                            Text("Скрыть от игроков до обнаружения", fontSize = 12.sp)
+                        }
                         Text("Тип метки", style = MaterialTheme.typography.labelMedium)
                         Box(Modifier.fillMaxWidth()) {
                             OutlinedButton(onClick = { typesExpanded = true }, modifier = Modifier.fillMaxWidth()) {
@@ -923,7 +1153,9 @@ fun LanGameScreen(
                         TextButton(onClick = { pendingPoint = null }) { Text("Отмена") }
                         Button(enabled = markerName.isNotBlank(), onClick = {
                             session.addMarker(LanMarker(UUID.randomUUID().toString(),
-                                markerName.trim(), markerDescription.trim(), markerType, point.first, point.second))
+                                markerName.trim(), markerDescription.trim(), markerType, point.first, point.second,
+                                hidden = isMaster && markerHidden))
+                            markerHidden = false
                             markerName = ""
                             markerDescription = ""
                             pendingPoint = null
@@ -966,8 +1198,8 @@ fun LanGameScreen(
                         (if (expanded) Modifier.fillMaxSize() else Modifier.fillMaxWidth().height(320.dp))
                             .clipToBounds()
                             .background(Color(0xFF171B21))
-                            .pointerInput(state.activeMapId, addingMarker, fogEditing) {
-                                if (!addingMarker && !fogEditing) {
+                            .pointerInput(state.activeMapId, addingMarker, fogEditing, detectionZoneEdit?.id) {
+                                if (!addingMarker && !fogEditing && detectionZoneEdit == null) {
                                     detectTransformGestures { centroid, pan, zoom, _ ->
                                         val previousZoom = cameraZoom
                                         val nextZoom = (previousZoom * zoom).coerceIn(1f, 5f)
@@ -1045,7 +1277,8 @@ fun LanGameScreen(
                                     )
                                 }
                                     .size(28.dp).clip(CircleShape)
-                                    .background(Color(0xFFFFC107))
+                                    .background(if (isMaster && marker.hidden && !marker.revealedAll)
+                                        Color(0xFF7258A7) else Color(0xFFFFC107))
                                     .border(1.dp, Color.White, CircleShape)
                                     .clickable {
                                         val interactive = marker.type in setOf("NPC", "Толпа", "Записка", "Сундук", "Дверь", "Дом", "Портал", "Магазин")
@@ -1056,7 +1289,19 @@ fun LanGameScreen(
                                         }
                                     },
                                 contentAlignment = Alignment.Center
-                            ) { Text(markerIcon(marker.type), fontSize = 15.sp) }
+                            ) { Text(if (isMaster && marker.hidden && !marker.revealedAll)
+                                "◈" else markerIcon(marker.type), fontSize = 15.sp) }
+                            if (marker.maxHp > 0) {
+                                Box(Modifier.offset {
+                                    IntOffset((smoothX * widthPx).roundToInt() - 26.dp.roundToPx(),
+                                        (smoothY * heightPx).roundToInt() + 16.dp.roundToPx())
+                                }.width(52.dp).background(Color(0xD9001219), MaterialTheme.shapes.small),
+                                    contentAlignment = Alignment.Center) {
+                                    Text("${marker.hp.coerceIn(0, marker.maxHp)}/${marker.maxHp}",
+                                        fontSize = 10.sp, color = Color.White, fontWeight = FontWeight.Bold,
+                                        maxLines = 1)
+                                }
+                            }
                         }
                         state.players.filter { (it.mapId.isBlank() || it.mapId == state.activeMapId) &&
                             (isMaster || state.fog.visible(it.x, it.y)) }.forEach { player ->
@@ -1087,6 +1332,17 @@ fun LanGameScreen(
                                     .border(2.dp, Color.White, CircleShape)
                                     .clickable { selectedPlayer = player }
                             )
+                            if (player.maxHp > 0) {
+                                Box(Modifier.offset {
+                                    IntOffset((smoothX * widthPx).roundToInt() - 28.dp.roundToPx(),
+                                        (smoothY * heightPx).roundToInt() + 15.dp.roundToPx())
+                                }.width(56.dp).background(Color(0xD9001219), MaterialTheme.shapes.small),
+                                    contentAlignment = Alignment.Center) {
+                                    Text("${player.hp.coerceIn(0, player.maxHp)}/${player.maxHp}",
+                                        fontSize = 10.sp, color = Color.White,
+                                        fontWeight = FontWeight.Bold, maxLines = 1)
+                                }
+                            }
                         }
                         if (state.fog.enabled) {
                             val fogPaint = if (isMaster) Color(0xB0000711) else Color(0xF700030A)
@@ -1122,6 +1378,54 @@ fun LanGameScreen(
                                             size = androidx.compose.ui.geometry.Size(tileW + .35f, tileH + .35f))
                                     }
                                 }
+                            }
+                        }
+                        if (isMaster && detectionZoneEdit != null && detectionZoneEdit!!.id in
+                            state.markers.map { it.id }) {
+                            val zone = detectionZoneEdit!!
+                            Canvas(Modifier.fillMaxSize()
+                                .pointerInput(zone.id, zone.revealShape) {
+                                    detectTapGestures { point ->
+                                        zoneRadiusX = kotlin.math.abs(point.x / size.width - zone.x)
+                                            .coerceIn(0.005f, 1f)
+                                        zoneRadiusY = kotlin.math.abs(point.y / size.height - zone.y)
+                                            .coerceIn(0.005f, 1f)
+                                    }
+                                }
+                                .pointerInput(zone.id, zone.revealShape) {
+                                    detectDragGestures(onDragStart = { point ->
+                                        zoneRadiusX = kotlin.math.abs(point.x / size.width - zone.x)
+                                            .coerceIn(0.005f, 1f)
+                                        zoneRadiusY = kotlin.math.abs(point.y / size.height - zone.y)
+                                            .coerceIn(0.005f, 1f)
+                                    }) { change, _ ->
+                                        change.consume()
+                                        zoneRadiusX = kotlin.math.abs(change.position.x / size.width - zone.x)
+                                            .coerceIn(0.005f, 1f)
+                                        zoneRadiusY = kotlin.math.abs(change.position.y / size.height - zone.y)
+                                            .coerceIn(0.005f, 1f)
+                                    }
+                                }
+                            ) {
+                                val rx = zoneRadiusX * size.width
+                                val ry = zoneRadiusY * size.height
+                                val center = Offset(zone.x * size.width, zone.y * size.height)
+                                val paint = Color(0xFFE9B65D)
+                                if (zone.revealShape == "rect") {
+                                    drawRect(paint.copy(alpha = 0.18f), Offset(center.x - rx, center.y - ry), Size(rx*2, ry*2))
+                                    drawRect(paint, Offset(center.x - rx, center.y - ry), Size(rx*2, ry*2), style = Stroke(width = 2.dp.toPx()))
+                                } else {
+                                    drawOval(paint.copy(alpha = 0.18f), Offset(center.x - rx, center.y - ry), Size(rx*2, ry*2))
+                                    drawOval(paint, Offset(center.x - rx, center.y - ry), Size(rx*2, ry*2), style = Stroke(width = 2.dp.toPx()))
+                                }
+                                drawCircle(Color.White, radius = 5.dp.toPx(), center = center)
+                            }
+                            Button(onClick = {
+                                session.updateMarker(zone.copy(revealRadiusX = zoneRadiusX,
+                                    revealRadiusY = zoneRadiusY))
+                                detectionZoneEdit = null
+                            }, modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)) {
+                                Text("✓ Сохранить область", fontSize = 11.sp)
                             }
                         }
                         } // Transform image, markers, players and fog as a single map.
@@ -1226,8 +1530,14 @@ fun LanGameScreen(
         // temporarily takes over this joystick; "Готово" returns to player control.
         val lockedByMaster = !isMaster && state.connected && state.myId.isNotBlank() &&
             state.masterMovingPlayerId == state.myId
+        val battleFighter = state.combat.fighters.firstOrNull {
+            it.kind == "player" && it.sourceId == state.myId
+        }
+        val battleMovementLocked = !isMaster && state.combat.phase == "active" &&
+            battleFighter != null &&
+            (state.combat.currentId != battleFighter.id || !battleFighter.movementAllowed)
         val guestCanWalk = !isMaster && state.connected && state.myId.isNotBlank() &&
-            !lockedByMaster && state.players.any { it.id == state.myId }
+            !lockedByMaster && !battleMovementLocked && state.players.any { it.id == state.myId }
         val controlsPlayer = movingOwnPlayer || (guestCanWalk && moveMarkerId == null)
         val controlledPlayerId = if (movingOwnPlayer) movingPlayerId else if (guestCanWalk && moveMarkerId == null)
             state.myId else null
@@ -1239,6 +1549,7 @@ fun LanGameScreen(
             Text(
                 when {
                     lockedByMaster -> "Мастер перемещает тебя"
+                    battleMovementLocked -> "⚔ Сначала выбери «Перемещение»"
                     controlsPlayer && !isMaster -> "Твой персонаж"
                     controlsPlayer -> "Персонаж"
                     moveMarkerId != null -> "Выбранная метка"
@@ -1337,6 +1648,20 @@ fun LanGameScreen(
         }
     }
 
+    // Keep the current map in place. Only the optional combat HUD is expanded.
+    // Without an image we retain the v26 standalone combat screen as a fallback.
+    val openCombatOnMap: () -> Unit = {
+        if (state.connected && bitmap != null) {
+            page = "map"
+            fullscreen = true
+            mapCombatExpanded = true
+            if (state.combat.phase != "active") mapCombatDialog = true
+        } else {
+            fullscreen = false
+            page = "combat"
+        }
+    }
+
     val roomMapControls: @Composable () -> Unit = {
         if (isMaster) {
             Box {
@@ -1349,10 +1674,23 @@ fun LanGameScreen(
                             text = { Text(if (info.id == state.activeMapId) "✓ ${info.name}" else info.name) },
                             onClick = {
                                 roomMapMenu = false
-                                session.switchMap(info.id)
+                                session.previewMap(info.id)
                             }
                         )
                     }
+                }
+            }
+            if (session.isPreparingMap()) {
+                Text("Подготовка: карта скрыта от игроков до публикации", fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.primary)
+                Button(onClick = { session.publishPreparedMap() },
+                    enabled = state.activeMapId.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
+                    Text("Показать карту всем")
+                }
+            } else {
+                OutlinedButton(onClick = { session.returnMapToPreparation() },
+                    enabled = state.activeMapId.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
+                    Text("Вернуть карту в подготовку")
                 }
             }
             Button(onClick = { showAddMapChooser = true },
@@ -1368,6 +1706,39 @@ fun LanGameScreen(
         } else {
             Text("🗺 ${state.mapName.ifBlank { "Нет карты" }}", fontSize = 13.sp)
         }
+    }
+
+    if (page == "combat" && state.connected) {
+        val ownBonus = activeCharacter?.let { character ->
+            val dex = CharacterStorage.loadAttributes(context, character.id)["Ловкость"] ?: 10
+            (Math.floorDiv(dex - 10, 2) + DndSheetStorage.load(context, character.id).initiativeBonus)
+                .coerceIn(-99, 99)
+        } ?: 0
+        Dialog(onDismissRequest = { page = "map" },
+            properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Surface(Modifier.fillMaxSize()) {
+                CombatScreen(
+                    lan = state, isMaster = isMaster, ownInitiativeBonus = ownBonus,
+                    onBack = { page = "map" }, onPrepare = { session.prepareCombat() },
+                    onAddPlayer = { session.addCombatPlayer(it) },
+                    onAddMarker = { session.addCombatMarker(it) },
+                    onAddCustom = { name, bonus -> session.addCombatCustom(name, bonus) },
+                    onRemove = { session.removeCombatFighter(it) },
+                    onMasterRoll = { id, roll, bonus -> session.masterCombatInitiative(id, roll, bonus) },
+                    onPlayerRoll = { session.combatCommand("roll", roll = it) },
+                    onStart = { session.startCombat() },
+                    onFinish = { session.finishCombat() },
+                    onNext = { if (isMaster) session.nextCombatTurn() else session.combatCommand("next") },
+                    onPrevious = { session.previousCombatTurn() },
+                    onRefund = { session.refundCombatAction() },
+                    onAction = { action, note ->
+                        if (isMaster) session.masterCombatAction(action, note)
+                        else session.combatCommand("act", label = action, details = note)
+                    }
+                )
+            }
+        }
+        return
     }
 
     if (page == "notes" && state.connected && !isMaster && activeCharacter != null) {
@@ -1448,6 +1819,7 @@ fun LanGameScreen(
                                         Triple("maps", "🗺 Карты", "Карты"),
                                         Triple("markers", "📍 Метки", "Метки"),
                                         Triple("players", "👥 Игроки", "Игроки"),
+                                        Triple("combat", "⚔ Бой", "Бой"),
                                         Triple("quests", "📖 Задания", "Задания"),
                                         Triple("world", "🌍 Мир", "Мир"),
                                         Triple("fog", "☁ Туман", "Туман"),
@@ -1520,6 +1892,16 @@ fun LanGameScreen(
                                                 }
                                             }
                                         }
+                                        "combat" -> {
+                                            Text("Боевой режим", fontWeight = FontWeight.Bold)
+                                            Text(when (state.combat.phase) {
+                                                "active" -> "Раунд ${state.combat.round} · ${state.combat.current?.name.orEmpty()}"
+                                                "setup" -> "Сбор инициативы"
+                                                else -> "Бой не начат"
+                                            }, fontSize = 12.sp)
+                                            Button(onClick = openCombatOnMap,
+                                                modifier = Modifier.fillMaxWidth()) { Text("⚔ Пульт боя") }
+                                        }
                                         "players" -> {
                                             Text("Игроки", fontWeight = FontWeight.Bold)
                                             if (state.players.isEmpty()) Text("Нет подключённых игроков", fontSize = 12.sp)
@@ -1584,6 +1966,10 @@ fun LanGameScreen(
                 if (!isMaster) Column(Modifier.width(118.dp), verticalArrangement=Arrangement.spacedBy(5.dp)) {
                     if (nearbyInteractions.isNotEmpty()) nearbyControl()
                     campControl()
+                    OutlinedButton(onClick = openCombatOnMap,
+                        modifier = Modifier.fillMaxWidth()) {
+                        Text(if (state.combat.phase == "active") "⚔ Раунд ${state.combat.round}" else "⚔ Бой", fontSize = 12.sp)
+                    }
                     OutlinedButton(onClick={journalReturnPage="map";page="quests"}, modifier=Modifier.fillMaxWidth()) {
                         Text("📖 Журнал",fontSize=12.sp)
                     }
@@ -1592,7 +1978,21 @@ fun LanGameScreen(
                     }
                 }
                 Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
-                    mapContent(true)
+                    mapContent(true) // unchanged image, markers, fog, touch gestures and camera
+                    MapCombatOverlay(
+                        lan = state,
+                        isMaster = isMaster,
+                        expanded = mapCombatExpanded,
+                        onToggle = { mapCombatExpanded = !mapCombatExpanded },
+                        onManage = { mapCombatDialog = true },
+                        onAction = { action, note ->
+                            if (isMaster) session.masterCombatAction(action, note)
+                            else session.combatCommand("act", label = action, details = note)
+                        },
+                        onNext = { if (isMaster) session.nextCombatTurn() else session.combatCommand("next") },
+                        onPrevious = { session.previousCombatTurn() },
+                        onRefund = { session.refundCombatAction() }
+                    )
                 }
                 Column(
                     Modifier.width(128.dp).fillMaxHeight(),
@@ -1621,14 +2021,55 @@ fun LanGameScreen(
         }
     }
 
+    // In landscape the initiative setup and advanced battle controls are an overlay
+    // over the original map, not a separate screen or a replacement for the joystick.
+    if (mapCombatDialog && fullscreen && page == "map" && state.connected) {
+        val ownBonus = activeCharacter?.let { character ->
+            val dex = CharacterStorage.loadAttributes(context, character.id)["Ловкость"] ?: 10
+            (Math.floorDiv(dex - 10, 2) + DndSheetStorage.load(context, character.id).initiativeBonus)
+                .coerceIn(-99, 99)
+        } ?: 0
+        Dialog(onDismissRequest = { mapCombatDialog = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Surface(
+                Modifier.fillMaxWidth(.82f).fillMaxHeight(.94f),
+                shape = MaterialTheme.shapes.large,
+                tonalElevation = 8.dp
+            ) {
+                CombatScreen(
+                    lan = state, isMaster = isMaster, ownInitiativeBonus = ownBonus,
+                    onBack = { mapCombatDialog = false },
+                    onPrepare = { session.prepareCombat() },
+                    onAddPlayer = { session.addCombatPlayer(it) },
+                    onAddMarker = { session.addCombatMarker(it) },
+                    onAddCustom = { name, bonus -> session.addCombatCustom(name, bonus) },
+                    onRemove = { session.removeCombatFighter(it) },
+                    onMasterRoll = { id, roll, bonus -> session.masterCombatInitiative(id, roll, bonus) },
+                    onPlayerRoll = { session.combatCommand("roll", roll = it) },
+                    onStart = { session.startCombat(); mapCombatDialog = false },
+                    onFinish = { session.finishCombat(); mapCombatDialog = false },
+                    onNext = { if (isMaster) session.nextCombatTurn() else session.combatCommand("next") },
+                    onPrevious = { session.previousCombatTurn() },
+                    onRefund = { session.refundCombatAction() },
+                    onAction = { action, note ->
+                        if (isMaster) session.masterCombatAction(action, note)
+                        else session.combatCommand("act", label = action, details = note)
+                    }
+                )
+            }
+        }
+    }
+
     if (!isMaster && state.connected && page != "map") {
         Column(Modifier.fillMaxSize().padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Сетевая игра", Modifier.weight(1f), fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 TextButton(onClick = { showRoomInfo = true }) { Text("ⓘ Инфо") }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 FilterChip(selected = false, onClick = { page = "map" }, label = { Text("Карта") })
+                FilterChip(selected = page == "combat", onClick = openCombatOnMap, label = { Text("⚔ Бой") })
                 if (!isMaster) {
                     FilterChip(selected = page == "game", onClick = { page = "game" }, label = { Text("Персонаж") })
                     FilterChip(selected = page == "abilities", onClick = { page = "abilities" }, label = { Text("Способности") })
@@ -1741,57 +2182,121 @@ fun LanGameScreen(
                 if (maps.isEmpty()) Text("Добавь изображение прямо здесь — общая библиотека тоже пополнится.")
 
             } else {
-                Text("Персонаж участника")
-                var guestMenu by remember { mutableStateOf(false) }
-                Box {
-                    OutlinedButton(onClick = { guestMenu = true }, modifier = Modifier.fillMaxWidth()) {
-                        Text(characters.firstOrNull { it.id == selectedGuestCharacterId }?.name ?: "Выбери персонажа")
+                if (providedGuestCharacter != null) {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Играем за ${providedGuestCharacter.name}", fontWeight = FontWeight.SemiBold)
+                            Text("${providedGuestCharacter.race} · ${providedGuestCharacter.profession} · уровень ${providedGuestCharacter.level}",
+                                style = MaterialTheme.typography.bodySmall)
+                            Text("Другого героя можно выбрать в списке персонажей.",
+                                style = MaterialTheme.typography.labelSmall)
+                        }
                     }
-                    DropdownMenu(expanded = guestMenu, onDismissRequest = { guestMenu = false }) {
-                        characters.forEach { character ->
-                            DropdownMenuItem(text = { Text(character.name) }, onClick = {
-                                selectedGuestCharacterId = character.id
-                                guestName = character.name
-                                guestMenu = false
-                            })
+                } else {
+                    Text("Персонаж участника")
+                    var guestMenu by remember { mutableStateOf(false) }
+                    Box {
+                        OutlinedButton(onClick = { guestMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                            Text(characters.firstOrNull { it.id == selectedGuestCharacterId }?.name ?: "Выбери персонажа")
+                        }
+                        DropdownMenu(expanded = guestMenu, onDismissRequest = { guestMenu = false }) {
+                            characters.forEach { character ->
+                                DropdownMenuItem(text = { Text(character.name) }, onClick = {
+                                    selectedGuestCharacterId = character.id
+                                    guestName = character.name
+                                    guestMenu = false
+                                })
+                            }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = guestName,
+                        onValueChange = { guestName = it.take(40) },
+                        label = { Text("Имя игрока") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                }
+                Text("Найденные комнаты в локальной сети", fontWeight = FontWeight.SemiBold)
+                Text("Подключитесь к Wi-Fi или точке доступа мастера. Поиск выполняется автоматически.",
+                    style = MaterialTheme.typography.bodySmall)
+                if (discoveredRooms.isEmpty()) {
+                    Text(if (discoveringRooms) "Поиск комнат… Если мастер уже создал комнату, она появится здесь."
+                         else "Поиск остановлен. Нажмите «Искать снова».")
+                } else {
+                    discoveredRooms.forEach { room ->
+                        OutlinedButton(
+                            onClick = {
+                                ip = room.address
+                                started = true
+                                session.join(room.address, guestName.trim(), selectedGuestCharacterId ?: 0L)
+                            },
+                            enabled = guestName.isNotBlank() && selectedGuestCharacterId != null,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(Modifier.fillMaxWidth()) {
+                                Text("${room.name}  ·  Подключиться")
+                                Text("${room.address} · ${room.via}", style = MaterialTheme.typography.bodySmall)
+                            }
                         }
                     }
                 }
-                OutlinedTextField(
-                    value = guestName,
-                    onValueChange = { guestName = it.take(40) },
-                    label = { Text("Имя игрока") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
-                )
-                OutlinedTextField(
-                    value = ip,
-                    onValueChange = { ip = it },
-                    label = { Text("IP телефона хоста") },
-                    placeholder = { Text("192.168.1.100") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
-                )
-                Button(
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = ip.isNotBlank() && guestName.isNotBlank(),
-                    onClick = {
-                        started = true
-                        session.join(ip.trim(), guestName.trim())
-                    }
-                ) { Text("Подключиться") }
+                OutlinedButton(onClick = {
+                    discoveringRooms = !discoveringRooms
+                    if (discoveringRooms) discoveredRooms = emptyList()
+                }, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (discoveringRooms) "Остановить поиск" else "Искать снова")
+                }
+                TextButton(onClick = { showManualIp = !showManualIp }) {
+                    Text(if (showManualIp) "Скрыть ручное подключение" else "Дополнительно: подключение по IP")
+                }
+                if (showManualIp) {
+                    OutlinedTextField(
+                        value = ip,
+                        onValueChange = { ip = it.trim().take(64) },
+                        label = { Text("IP телефона мастера") },
+                        placeholder = { Text("192.168.1.100") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = ip.isNotBlank() && guestName.isNotBlank() && selectedGuestCharacterId != null,
+                        onClick = {
+                            started = true
+                            session.join(ip.trim(), guestName.trim(), selectedGuestCharacterId ?: 0L)
+                        }
+                    ) { Text("Подключиться по IP") }
+                }
             }
         }
         if (!state.connected && started) {
             Text(state.status, color = MaterialTheme.colorScheme.error)
         }
         if (state.connected) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Horizontal scrolling keeps every navigation action reachable on
+            // narrow portrait phones without forcing the user to rotate.
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = page == "map", onClick = { page = "map" }, label = { Text("Общая карта") })
+                FilterChip(selected = page == "combat", onClick = openCombatOnMap,
+                    label = { Text(if (state.combat.phase == "active") "⚔ Р${state.combat.round}" else "⚔ Бой") })
                 FilterChip(selected = page == "game", onClick = { page = "game" }, label = { Text("Персонаж") })
                 FilterChip(selected = page == "abilities", onClick = { page = "abilities" }, label = { Text("Способности") })
+                if (!isMaster && activeCharacter != null) {
+                    FilterChip(selected = page == "notes", onClick = {
+                        journalReturnPage = "map"; page = "notes"
+                    }, label = { Text("Заметки") })
+                    FilterChip(selected = page == "quests", onClick = {
+                        journalReturnPage = "map"; page = "quests"
+                    }, label = { Text("Задания") })
+                    if (state.permissions.skillTreeEnabled) FilterChip(
+                        selected = page == "talents", onClick = { page = "talents" },
+                        label = { Text("Древо") })
+                }
             }
-            if (isMaster) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (isMaster) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { showPermissions = true }) { Text("⚙ Права") }
                 OutlinedButton(onClick = { showLogs = true }) { Text("☷ Журнал") }
                 OutlinedButton(onClick={journalReturnPage="map";page="quests"}){Text("📖 Задания")}

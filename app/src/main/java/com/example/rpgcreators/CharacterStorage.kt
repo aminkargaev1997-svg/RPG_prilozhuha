@@ -35,6 +35,7 @@ object CharacterStorage {
                 put("experienceRequired", character.experienceRequired)
                 put("autoExperience", character.autoExperience)
                 put("prestigePoints", character.prestigePoints)
+                put("buildVersion", character.buildVersion)
             })
         }
         preferences(context).edit()
@@ -58,7 +59,8 @@ object CharacterStorage {
                     experienceRequired = item.optInt("experienceRequired", 250).coerceAtLeast(1),
                     // Legacy characters had a freely configured fixed threshold.
                     autoExperience = item.optBoolean("autoExperience", false),
-                    prestigePoints = item.optInt("prestigePoints", 0).coerceAtLeast(0)
+                    prestigePoints = item.optInt("prestigePoints", 0).coerceAtLeast(0),
+                    buildVersion = item.optInt("buildVersion", 1).coerceIn(1, 2)
                 )
             }
         } catch (_: Exception) {
@@ -83,6 +85,63 @@ object CharacterStorage {
         category = "Особые", description = "Для группового перехода с расстояния. Два применения за игровой день."
     )
 
+    // One locally persisted wallet per character; copper is the exact accounting unit.
+    // Shop wallets are maintained by the LAN host and are NOT silently overwritten.
+    private fun walletKey(characterId: Long) = "wallet_copper_" + characterId
+    private fun walletLedgerKey(characterId: Long) = "wallet_ledger_copper_" + characterId
+    // Signed cumulative manual/loot adjustments, not affected by shop purchases or master grants.
+    fun walletLedgerCopper(context: Context, characterId: Long): Long =
+        preferences(context).getLong(walletLedgerKey(characterId), 0L)
+
+    /** Align the locally displayed cash with the master's authoritative shop balance.
+     * The local sub-gold remainder is preserved. Never count this as a new deposit.
+     */
+    fun mirrorHostWallet(context: Context, characterId: Long, hostGold: Int): Long = synchronized(this) {
+        val remainder = walletCopper(context, characterId) % 100L
+        val result = hostGold.coerceAtLeast(0).toLong() * 100L + remainder
+        preferences(context).edit().putLong(walletKey(characterId), result).commit()
+        result
+    }
+    fun walletCopper(context: Context, characterId: Long): Long =
+        preferences(context).getLong(walletKey(characterId), 0L).coerceAtLeast(0L)
+
+    fun changeWallet(context: Context, characterId: Long, delta: Long): Long = synchronized(this) {
+        val current = walletCopper(context, characterId)
+        val next = (current + delta).coerceIn(0L, 1_000_000_000_000L)
+        val applied = next - current
+        preferences(context).edit().putLong(walletKey(characterId), next)
+            .putLong(walletLedgerKey(characterId), walletLedgerCopper(context, characterId) + applied).commit()
+        next
+    }
+
+    // Exact denominations only. A story coin, a relic or a "golden ring" stays an item.
+    fun currencyCopperValue(name: String): Int = RpgCurrency.denomination(name)
+
+    /** Convert legacy coin stacks once, and atomically remove them from the inventory. */
+    fun migrateCoinItems(context: Context, characterId: Long) = synchronized(this) {
+        val prefs = preferences(context)
+        val key = INVENTORY_PREFIX + characterId
+        val raw = prefs.getString(key, null) ?: return@synchronized
+        val array = try { JSONArray(raw) } catch (_: Exception) { return@synchronized }
+        val remaining = JSONArray()
+        var total = 0L
+        for (i in 0 until array.length()) {
+            val obj = array.optJSONObject(i) ?: continue
+            val denomination = currencyCopperValue(obj.optString("name"))
+            val qty = obj.optString("quantity", "1").ifBlank { "1" }.toLongOrNull()
+            if (denomination > 0 && qty != null && qty in 1..1_000_000) {
+                total += denomination.toLong() * qty
+            } else remaining.put(obj)
+        }
+        if (total > 0) {
+            val before = walletCopper(context, characterId)
+            val after = (before + total).coerceAtMost(RpgCurrency.MAX_COPPER)
+            prefs.edit().putString(key, remaining.toString())
+                .putLong(walletKey(characterId), after)
+                .putLong(walletLedgerKey(characterId), walletLedgerCopper(context, characterId) + after - before).commit()
+        }
+    }
+
     // ИНВЕНТАРЬ
     fun saveInventory(context: Context, characterId: Long, items: List<InventoryItem>) {
         val array = JSONArray()
@@ -93,6 +152,7 @@ object CharacterStorage {
                 put("quantity", item.quantity)
                 put("description", item.description)
                 put("category", item.category)
+                put("effects", ItemEffectEngine.toJson(item.effects))
             })
         }
         preferences(context).edit()
@@ -101,6 +161,7 @@ object CharacterStorage {
     }
 
     fun loadInventory(context: Context, characterId: Long): List<InventoryItem> {
+        migrateCoinItems(context, characterId)
         val saved = preferences(context)
             .getString(INVENTORY_PREFIX + characterId, null) ?: return listOf(journalItem(characterId), teleportScroll(characterId))
         return try {
@@ -112,7 +173,8 @@ object CharacterStorage {
                     name = item.getString("name"),
                     quantity = item.optString("quantity", ""),
                     description = item.optString("description", ""),
-                    category = item.optString("category", "Прочее")
+                    category = item.optString("category", "Прочее"),
+                    effects = if (item.has("effects")) ItemEffectEngine.fromJson(item.optJSONArray("effects")) else ItemEffectEngine.template(item.optString("name"))
                 )
             }
         } catch (_: Exception) {
@@ -136,7 +198,7 @@ object CharacterStorage {
         (existing + goods).forEach { item ->
             data.put(JSONObject().put("id", item.id).put("name", item.name)
                 .put("quantity", item.quantity).put("description", item.description)
-                .put("category", item.category))
+                .put("category", item.category).put("effects", ItemEffectEngine.toJson(item.effects)))
         }
         prefs.edit().putString(INVENTORY_PREFIX + characterId, data.toString())
             .putBoolean(key, true).commit()
@@ -145,7 +207,7 @@ object CharacterStorage {
     // ЭКИПИРОВКА
     fun saveEquipment(context: Context, characterId: Long, equipment: Map<String, Long>) {
         val json = JSONObject()
-        equipment.forEach { (slot, itemId) -> json.put(slot, itemId) }
+        EquipmentHands.migrate(equipment, loadInventory(context, characterId)).forEach { (slot, itemId) -> json.put(slot, itemId) }
         preferences(context).edit()
             .putString(EQUIPMENT_PREFIX + characterId, json.toString())
             .apply()
@@ -156,13 +218,13 @@ object CharacterStorage {
             .getString(EQUIPMENT_PREFIX + characterId, null) ?: return emptyMap()
         return try {
             val json = JSONObject(saved)
-            buildMap {
+            EquipmentHands.migrate(buildMap {
                 val keys = json.keys()
                 while (keys.hasNext()) {
                     val key = keys.next()
                     put(key, json.getLong(key))
                 }
-            }
+            }, loadInventory(context, characterId))
         } catch (_: Exception) {
             emptyMap()
         }
@@ -206,6 +268,7 @@ object CharacterStorage {
                 put("passiveDescription", ability.passiveDescription)
                 put("isUsed", ability.isUsed)
                 put("origin", ability.origin)
+                put("spellLevel", ability.spellLevel)
             })
         }
         preferences(context).edit()
@@ -237,7 +300,8 @@ object CharacterStorage {
                         if (legacyPassive) "Пассивный эффект (запись из старой версии)" else ""
                     ),
                     isUsed = item.optBoolean("isUsed", false),
-                    origin = item.optString("origin", "")
+                    origin = item.optString("origin", ""),
+                    spellLevel = item.optInt("spellLevel", 0).coerceIn(-1, 9)
                 )
             }
         } catch (_: Exception) {
@@ -364,6 +428,7 @@ object CharacterStorage {
 
         editor.apply()
         SkillTreeStorage.clear(context, characterId)
+        HeroStoryStorage.clear(context, characterId)
         RpgQuestStorage.deleteCharacter(context, characterId)
     }
 }

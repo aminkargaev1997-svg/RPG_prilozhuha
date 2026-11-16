@@ -41,13 +41,15 @@ internal fun applyLanMasterEdit(
             "grant_xp" -> {
                 val amount = data.optInt("value", 0)
                 if (amount !in 1..1_000_000_000) return false
-                onCharacterUpdate(original.addExperience(amount))
+                onCharacterUpdate(original.addExperience(amount,
+                    SkillTreeStorage.load(context, edit.characterId).grantedPoints))
             }
             "set_xp" -> {
                 val xp = data.optInt("value", -1)
                 if (xp < 0) return false
                 // If the target XP crosses a threshold, level up normally.
-                onCharacterUpdate(original.copy(experience = 0).addExperience(xp))
+                onCharacterUpdate(original.copy(experience = 0).addExperience(xp,
+                    SkillTreeStorage.load(context, edit.characterId).grantedPoints))
             }
             "max_xp" -> {
                 val maximum = data.optInt("value", 0)
@@ -56,7 +58,8 @@ internal fun applyLanMasterEdit(
                     experienceRequired = maximum,
                     experience = 0,
                     autoExperience = false
-                ).addExperience(original.experience))
+                ).addExperience(original.experience,
+                    SkillTreeStorage.load(context, edit.characterId).grantedPoints))
             }
             "auto_xp" -> {
                 val required = experienceForLevel(original.level)
@@ -70,8 +73,8 @@ internal fun applyLanMasterEdit(
                 val delta = data.optInt("value", Int.MIN_VALUE)
                 if (delta !in -1000..1000) return false
                 val current = SkillTreeStorage.load(context, edit.characterId)
-                SkillTreeStorage.save(context, edit.characterId, current.copy(
-                    grantedPoints = (current.grantedPoints + delta).coerceIn(-100_000, 100_000)))
+                SkillTreeStorage.save(context, edit.characterId,
+                    SkillTreeEngine.adjustGrantedPoints(original, current, delta))
             }
             "skill_reset" -> {
                 val current = SkillTreeStorage.load(context, edit.characterId)
@@ -105,7 +108,9 @@ internal fun applyLanMasterEdit(
                     name = name,
                     quantity = data.optString("quantity").take(60),
                     description = data.optString("description").take(500),
-                    category = data.optString("category", "Прочее").take(60)
+                    category = data.optString("category", if (index >= 0) current[index].category else "Прочее").take(60),
+                    effects = if (data.has("effects")) ItemEffectEngine.fromJson(data.optJSONArray("effects"))
+                        else if (index >= 0) current[index].effects else ItemEffectEngine.template(name)
                 )
                 if (index >= 0) current[index] = item else current.add(item)
                 CharacterStorage.saveInventory(context, edit.characterId, current)
@@ -133,6 +138,7 @@ internal fun applyLanMasterEdit(
                     activatorDescription = data.optString("activator").take(500),
                     passiveDescription = data.optString("passive").take(500),
                     isUsed = data.optBoolean("used", false),
+                    spellLevel = data.optInt("spellLevel", if (index >= 0) current[index].spellLevel else 0).coerceIn(-1, 9),
                     origin = if (index >= 0) current[index].origin.ifBlank {
                         if (current[index].isStoryTrait) "hero_story" else ""
                     } else ""
@@ -159,11 +165,23 @@ internal fun applyLanMasterEdit(
                     origin = "hero_story"))
                 CharacterStorage.saveAbilities(context, edit.characterId, current)
             }
+            "adjust_health" -> {
+                val delta = data.optInt("delta", 0)
+                if (delta !in -100000..100000 || delta == 0) return false
+                val current = AdventureVitalsStorage.currentHealth(context, edit.characterId)
+                val maximum = AdventureVitalsStorage.effectiveMaxHealth(context, edit.characterId).coerceAtLeast(1)
+                AdventureVitalsStorage.save(context, edit.characterId,
+                    (current.toLong() + delta.toLong()).coerceIn(0L, maximum.toLong()).toInt(),
+                    AdventureVitalsStorage.maxHealth(context, edit.characterId))
+            }
             "adventure_rest" -> {
                 // End-of-night restoration. Passive features stay unchanged.
                 val abilities = CharacterStorage.loadAbilities(context, edit.characterId)
                 CharacterStorage.saveAbilities(context, edit.characterId, abilities.map { it.copy(isUsed = false) })
                 AdventureVitalsStorage.fullRest(context, edit.characterId)
+                val sheet = DndSheetStorage.load(context, edit.characterId)
+                DndSheetStorage.save(context, edit.characterId,
+                    sheet.copy(spellSlotsRemaining = sheet.spellSlotsMax.toList()))
             }
             "ability_delete" -> {
                 val id = data.optLong("id", 0)
@@ -176,8 +194,13 @@ internal fun applyLanMasterEdit(
                 val slot = data.optString("slot").trim().take(60)
                 val id = data.optLong("itemId", 0L)
                 if (slot.isBlank()) return false
-                if (id != 0L && CharacterStorage.loadInventory(context, edit.characterId).none { it.id == id }) return false
+                val item = CharacterStorage.loadInventory(context, edit.characterId).firstOrNull { it.id == id }
+                if (id != 0L && (item == null || CharacterStorage.isBoundItem(item) ||
+                    (item.quantity.toIntOrNull() ?: 1) <= 0 ||
+                    !EquipmentHands.canEquip(slot, item, CharacterStorage.loadEquipment(context, edit.characterId),
+                        CharacterStorage.loadInventory(context, edit.characterId)))) return false
                 val equipment = CharacterStorage.loadEquipment(context, edit.characterId).toMutableMap()
+                if (id != 0L && equipment.any { (otherSlot, otherId) -> otherSlot != slot && otherId == id }) return false
                 if (id == 0L) equipment.remove(slot) else equipment[slot] = id
                 CharacterStorage.saveEquipment(context, edit.characterId, equipment)
             }

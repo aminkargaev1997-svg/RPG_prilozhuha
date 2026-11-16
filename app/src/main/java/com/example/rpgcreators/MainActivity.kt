@@ -12,6 +12,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
@@ -45,6 +46,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -52,7 +54,6 @@ import com.example.rpgcreators.ui.theme.RPGCreatorsTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
-import kotlin.random.Random
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -78,6 +79,10 @@ fun AppScreen(modifier: Modifier = Modifier) {
     var appRole by rememberSaveable { mutableStateOf("player") }
     var selectedCharacterId by rememberSaveable { mutableStateOf<Long?>(null) }
     var showDeleteDialog by rememberSaveable { mutableStateOf(false) }
+    // The player's hero is selected before choosing offline/LAN play.
+    var showPlayModeSheet by rememberSaveable { mutableStateOf(false) }
+    var playChoiceReturnScreen by rememberSaveable { mutableStateOf("heroes") }
+    var lanReturnScreen by rememberSaveable { mutableStateOf("heroes") }
 
     // Для выбранной карты сохраняем простые поля, а не сам объект.
     var selectedMapId by rememberSaveable { mutableStateOf<Long?>(null) }
@@ -94,18 +99,44 @@ fun AppScreen(modifier: Modifier = Modifier) {
         GameMap(id = id, name = selectedMapName, imageUri = selectedMapImageUri)
     }
 
+    // Hardware/system back follows the same route as the visible player controls.
+    // The host workflow is deliberately unchanged.
+    BackHandler(enabled = appRole == "player" && currentScreen != "home" && currentScreen != "lan") {
+        when {
+            showDeleteDialog -> showDeleteDialog = false
+            showPlayModeSheet -> showPlayModeSheet = false
+            else -> currentScreen = when (currentScreen) {
+                "heroes", "playerMenu", "list" -> "home"
+                "create", "details" -> "heroes"
+                "edit", "game" -> "details"
+                "mapDetails" -> "maps"
+                "abilities", "notes", "talents", "journal", "maps" -> "game"
+                else -> "heroes"
+            }
+        }
+    }
+
     when (currentScreen) {
 
         "home" -> RoleSelectionScreen(
-            onPlayer = { appRole = "player"; currentScreen = "playerMenu" },
+            onPlayer = { appRole = "player"; currentScreen = "heroes" },
             onMaster = { appRole = "master"; currentScreen = "masterMenu" }
         )
-        "playerMenu" -> MainScreen(
-            modifier,
-            { currentScreen = "create" },
-            { currentScreen = "list" },
-            { currentScreen = "lan" },
-            onBack = { currentScreen = "home" }
+        // Legacy route names are intentionally retained for old restored navigation state.
+        "heroes", "playerMenu", "list" -> PlayerHeroesScreen(
+            modifier = modifier,
+            characters = characters,
+            onBack = { currentScreen = "home" },
+            onCreate = { currentScreen = "create" },
+            onOpen = { character ->
+                selectedCharacterId = character.id
+                currentScreen = "details"
+            },
+            onPlay = { character ->
+                selectedCharacterId = character.id
+                playChoiceReturnScreen = "heroes"
+                showPlayModeSheet = true
+            }
         )
         "masterMenu" -> MasterMenuScreen(
             onNetwork = { currentScreen = "lan" },
@@ -115,8 +146,9 @@ fun AppScreen(modifier: Modifier = Modifier) {
         "lan" -> LanGameScreen(
             modifier = modifier,
             characters = characters.toList(),
-            onBack = { currentScreen = if (appRole == "master") "masterMenu" else "playerMenu" },
+            onBack = { currentScreen = if (appRole == "master") "masterMenu" else lanReturnScreen },
             isMaster = appRole == "master",
+            preselectedCharacterId = if (appRole == "master") null else selectedCharacterId,
             onCharacterUpdate = { updated ->
                 val index = characters.indexOfFirst { it.id == updated.id }
                 if (index >= 0) {
@@ -127,28 +159,23 @@ fun AppScreen(modifier: Modifier = Modifier) {
         )
 
         "create" -> CreateCharacterScreen(
-            onBack = { currentScreen = "home" },
-            onCreate = {
-                characters.add(it)
+            onBack = { currentScreen = "heroes" },
+            onCreate = { created ->
+                characters.add(created)
                 CharacterStorage.saveCharacters(context, characters.toList())
-                currentScreen = "list"
-            }
-        )
-
-        "list" -> CharacterListScreen(
-            characters,
-            onBack = { currentScreen = "home" },
-            onSelectCharacter = {
-                selectedCharacterId = it.id
-                currentScreen = "details"
+                selectedCharacterId = created.id
+                currentScreen = "heroes"
             }
         )
 
         "details" -> selectedCharacter?.let { character ->
             CharacterDetailsScreen(
                 character,
-                onBack = { currentScreen = "list" },
-                onPlay = { currentScreen = "game" },
+                onBack = { currentScreen = "heroes" },
+                onPlay = {
+                    playChoiceReturnScreen = "details"
+                    showPlayModeSheet = true
+                },
                 onEdit = { currentScreen = "edit" },
                 onDelete = { showDeleteDialog = true },
                 onUpdateCharacter = { updated ->
@@ -254,6 +281,22 @@ fun AppScreen(modifier: Modifier = Modifier) {
         }
     }
 
+    if (showPlayModeSheet && selectedCharacter != null) {
+        PlayerPlayModeSheet(
+            character = selectedCharacter,
+            onDismiss = { showPlayModeSheet = false },
+            onOffline = {
+                showPlayModeSheet = false
+                currentScreen = "game"
+            },
+            onLan = {
+                showPlayModeSheet = false
+                lanReturnScreen = playChoiceReturnScreen
+                currentScreen = "lan"
+            }
+        )
+    }
+
     if (showDeleteDialog && selectedCharacter != null) {
         AlertDialog(
             onDismissRequest = {
@@ -283,7 +326,7 @@ fun AppScreen(modifier: Modifier = Modifier) {
 
                         selectedCharacterId = null
                         showDeleteDialog = false
-                        currentScreen = "list"
+                        currentScreen = "heroes"
                     }
                 ) {
                     Text("Удалить")
@@ -330,116 +373,6 @@ fun MasterMenuScreen(onNetwork: () -> Unit, onBack: () -> Unit) {
 }
 
 @Composable
-fun MainScreen(
-    modifier: Modifier = Modifier,
-    onCreateCharacter: () -> Unit,
-    onShowCharacters: () -> Unit,
-    onNetwork: () -> Unit,
-    onBack: () -> Unit = {}
-) {
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            "RPG Creators",
-            fontSize = 32.sp,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary
-        )
-
-        Spacer(Modifier.height(12.dp))
-
-        TextButton(onClick = onBack) { Text("← Выбор роли") }
-
-        Text("Создай своего персонажа")
-
-        Spacer(Modifier.height(40.dp))
-
-        Button(
-            onClick = onCreateCharacter,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Создать персонажа")
-        }
-
-        Spacer(Modifier.height(16.dp))
-
-        Button(
-            onClick = onShowCharacters,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Мои персонажи")
-        }
-
-        Spacer(Modifier.height(16.dp))
-
-        Button(
-            onClick = onNetwork,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Сетевая игра (LAN)")
-        }
-
-    }
-}
-
-@Composable
-fun CharacterListScreen(
-    characters: List<Character>,
-    onBack: () -> Unit,
-    onSelectCharacter: (Character) -> Unit
-) {
-    Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        Text(
-            "Мои персонажи",
-            fontSize = 26.sp,
-            fontWeight = FontWeight.Bold
-        )
-
-        if (characters.isEmpty()) {
-            Text("Пока персонажей нет.")
-        }
-
-        characters.forEach { character ->
-            Card(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        onSelectCharacter(character)
-                    }
-            ) {
-                Column(Modifier.padding(16.dp)) {
-                    Text(
-                        character.name,
-                        fontSize = 19.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-
-                    Text("${character.race} • ${character.profession}")
-                }
-            }
-        }
-
-        OutlinedButton(
-            onClick = onBack,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("← Назад на главную")
-        }
-    }
-}
-
-@Composable
 fun CharacterDetailsScreen(
     character: Character,
     onBack: () -> Unit,
@@ -448,6 +381,7 @@ fun CharacterDetailsScreen(
     onDelete: () -> Unit,
     onUpdateCharacter: (Character) -> Unit
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     var showExperienceDialog by remember(character.id) { mutableStateOf(false) }
     var showMaximumDialog by remember(character.id) { mutableStateOf(false) }
     var experienceInput by remember { mutableStateOf("") }
@@ -473,7 +407,8 @@ fun CharacterDetailsScreen(
                     enabled = (experienceInput.toIntOrNull() ?: 0) > 0,
                     onClick = {
                         val amount = experienceInput.toIntOrNull() ?: 0
-                        onUpdateCharacter(character.addExperience(amount))
+                        onUpdateCharacter(character.addExperience(amount,
+                            SkillTreeStorage.load(context, character.id).grantedPoints))
                         experienceInput = ""
                         showExperienceDialog = false
                     }
@@ -510,7 +445,8 @@ fun CharacterDetailsScreen(
                             experience = 0,
                             experienceRequired = max,
                             autoExperience = false
-                        ).addExperience(total)
+                        ).addExperience(total,
+                            SkillTreeStorage.load(context, character.id).grantedPoints)
                         onUpdateCharacter(updated)
                         showMaximumDialog = false
                     }
@@ -522,83 +458,91 @@ fun CharacterDetailsScreen(
         )
     }
 
+    var experienceExpanded by remember(character.id) { mutableStateOf(false) }
+    var moreMenuExpanded by remember(character.id) { mutableStateOf(false) }
+
     Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Text(
-            character.name,
-            fontSize = 30.sp,
-            fontWeight = FontWeight.Bold
-        )
-
-        Text("Раса: ${character.race}", fontSize = 18.sp)
-        Text("Профессия: ${character.profession}", fontSize = 18.sp)
-
-        Text("Уровень ${character.level} / $MAX_CHARACTER_LEVEL", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-        if (character.level == MAX_CHARACTER_LEVEL) {
-            Text("Максимальный уровень. Каждые ${character.experienceRequired} XP дают +$POST_CAP_TREE_POINTS очка древа.",
-                fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-            Text("Дополнительных очков после 20 уровня: ${character.prestigePoints}")
-        }
-        Text("${character.experience}/${character.experienceRequired} опыта", fontSize = 18.sp)
-        LinearProgressIndicator(
-            progress = { character.experience.toFloat() / character.experienceRequired.coerceAtLeast(1) },
-            modifier = Modifier.fillMaxWidth()
-        )
-        Button(
-            onClick = { experienceInput = ""; showExperienceDialog = true },
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("Добавить опыт") }
-        OutlinedButton(
-            onClick = { maximumInput = character.experienceRequired.toString(); showMaximumDialog = true },
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("Изменить максимум опыта") }
-        Text(if (character.autoExperience) "Опыт рассчитывается автоматически: 650 + 750 × (уровень − 1)"
-             else "Установлен ручной максимум опыта", fontSize = 12.sp)
-        if (!character.autoExperience) {
-            TextButton(onClick = {
-                val max = experienceForLevel(character.level)
-                onUpdateCharacter(character.copy(
-                    experienceRequired = max,
-                    experience = character.experience.coerceAtMost(max - 1),
-                    autoExperience = true
-                ))
-            }) { Text("Включить автоматический максимум") }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onBack) { Text("← Герои") }
+            Spacer(Modifier.weight(1f))
+            Box {
+                OutlinedButton(onClick = { moreMenuExpanded = true }) { Text("⋯") }
+                DropdownMenu(expanded = moreMenuExpanded, onDismissRequest = { moreMenuExpanded = false }) {
+                    DropdownMenuItem(text = { Text("Редактировать героя") }, onClick = {
+                        moreMenuExpanded = false
+                        onEdit()
+                    })
+                    DropdownMenuItem(text = { Text("Удалить персонажа", color = MaterialTheme.colorScheme.error) }, onClick = {
+                        moreMenuExpanded = false
+                        onDelete()
+                    })
+                }
+            }
         }
 
-        Spacer(Modifier.height(8.dp))
-
-        Button(
-            onClick = onPlay,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Играть")
+        Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp)) {
+            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(character.name, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                Text("${character.race} · ${character.profession}",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Уровень ${character.level} / $MAX_CHARACTER_LEVEL", fontWeight = FontWeight.SemiBold)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Опыт", style = MaterialTheme.typography.labelLarge)
+                    Text("${character.experience} / ${character.experienceRequired}",
+                        style = MaterialTheme.typography.labelLarge)
+                }
+                LinearProgressIndicator(
+                    progress = { (character.experience.toFloat() /
+                        character.experienceRequired.coerceAtLeast(1)).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (character.level == MAX_CHARACTER_LEVEL) {
+                    Text("Очки древа после 20 уровня: ${character.prestigePoints}" +
+                        if (character.buildVersion >= 2) " (по +1, общий предел ${SkillTreeEngine.maxPoints(character)})" else " (по +2)",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+                TextButton(onClick = { experienceExpanded = !experienceExpanded }) {
+                    Text(if (experienceExpanded) "Скрыть настройки опыта ⌃" else "Управление опытом ⌄")
+                }
+                if (experienceExpanded) {
+                    OutlinedButton(onClick = { experienceInput = ""; showExperienceDialog = true },
+                        modifier = Modifier.fillMaxWidth()) { Text("＋ Добавить опыт") }
+                    OutlinedButton(onClick = {
+                        maximumInput = character.experienceRequired.toString()
+                        showMaximumDialog = true
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Изменить порог уровня") }
+                    Text(if (character.autoExperience)
+                        "Порог рассчитывается автоматически по уровню."
+                        else "Установлен ручной порог уровня.",
+                        style = MaterialTheme.typography.bodySmall)
+                    if (!character.autoExperience) {
+                        TextButton(onClick = {
+                            val max = experienceForLevel(character.level)
+                            onUpdateCharacter(character.copy(
+                                experienceRequired = max,
+                                experience = character.experience.coerceAtMost(max - 1),
+                                autoExperience = true
+                            ))
+                        }) { Text("Вернуть автоматический расчёт") }
+                    }
+                }
+            }
         }
 
-        Button(
-            onClick = onEdit,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Редактировать")
-        }
+        HeroStoryCard(character.id)
 
-        Button(
-            onClick = onDelete,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Удалить персонажа")
+        Button(onClick = onPlay, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
+            Text("▶ Играть")
         }
-
-        OutlinedButton(
-            onClick = onBack,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("← Назад к списку")
+        OutlinedButton(onClick = onEdit, modifier = Modifier.fillMaxWidth()) {
+            Text("Изменить персонажа")
         }
+        Text("Игра, способности, инвентарь и заметки откроются после выбора режима.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -608,7 +552,8 @@ data class InventoryItem(
     val quantity: String = "",
     val description: String = "",
     val position: Offset = Offset.Zero,
-    val category: String = "Прочее"
+    val category: String = "Прочее",
+    val effects: List<ItemEffect> = emptyList()
 )
 
 data class Ability(
@@ -618,7 +563,8 @@ data class Ability(
     val activatorDescription: String = "",
     val passiveDescription: String = "",
     val isUsed: Boolean = false,
-    val origin: String = "" // "hero_story" means only the master may edit/delete this trait.
+    val origin: String = "", // "hero_story" means only the master may edit/delete this trait.
+    val spellLevel: Int = 0 // 0 = ordinary, -1 = cantrip (free), 1..9 = spell slot circle
 ) {
     val isStoryTrait: Boolean
         get() = origin == "hero_story" || description == "Положительная черта истории героя" ||
@@ -647,11 +593,7 @@ data class MapMarker(
 )
 
 private val equipmentSlots = listOf(
-    "Голова",
-    "Тело",
-    "Руки",
-    "Ноги",
-    "Голени"
+    "Голова", "Тело", "Руки", "Ноги", "Голени", "Аксессуар"
 )
 
 private val defaultAttributes = listOf(
@@ -727,12 +669,16 @@ fun GameScreen(
         mutableIntStateOf(AdventureVitalsStorage.currentHealth(context, character.id))
     }
     val talentBonuses = SkillTreeEngine.bonus(character, SkillTreeStorage.load(context, character.id))
+    val equipmentBonuses = ItemEffectEngine.total(inventoryItems.toList(), equipment.toMap())
+
     var showInventoryCatalog by remember { mutableStateOf(false) }
+    var showRingSlots by remember(character.id) { mutableStateOf(false) }
     var showAddDialog by remember { mutableStateOf(false) }
     var deleteMode by remember { mutableStateOf(false) }
 
     var itemName by remember { mutableStateOf("") }
     var itemDescription by remember { mutableStateOf("") }
+    var itemPresetEffects by remember { mutableStateOf(emptyList<ItemEffect>()) }
     var selectedInventoryItem by remember { mutableStateOf<InventoryItem?>(null) }
     var showInventoryDetails by remember { mutableStateOf(false) }
     var hasQuantity by remember { mutableStateOf(false) }
@@ -742,6 +688,11 @@ fun GameScreen(
     var inventoryCategory by rememberSaveable(character.id) { mutableStateOf("Все") }
     var inventorySort by rememberSaveable(character.id) { mutableStateOf("Новые") }
     var inventoryListMode by rememberSaveable(character.id) { mutableStateOf(false) }
+    var localWalletCopper by remember(character.id) { mutableLongStateOf(CharacterStorage.walletCopper(context, character.id)) }
+    var walletExpanded by remember(character.id) { mutableStateOf(false) }
+    var walletAdjustment by remember { mutableStateOf("") }
+    var walletDenomination by remember { mutableStateOf(100) }
+
 
     var selectedSlot by remember { mutableStateOf<String?>(null) }
     var editingAttribute by remember { mutableStateOf<String?>(null) }
@@ -789,23 +740,43 @@ fun GameScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
+        val effectiveMaxHp = (maximumHealth + equipmentBonuses.maxHpBonus).coerceIn(1, 99999)
         TextButton(onClick = { showVitals = !showVitals }) {
-            Text("❤ Здоровье: $currentHealth / $maximumHealth  ${if (showVitals) "▴" else "▾"}")
+            Text("❤ Здоровье: ${currentHealth.coerceAtMost(effectiveMaxHp)} / $effectiveMaxHp  ${if (showVitals) "▴" else "▾"}")
         }
         if (showVitals) {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("Текущее здоровье", style = MaterialTheme.typography.labelMedium)
                 Slider(value = currentHealth.toFloat(), onValueChange = { value ->
-                    currentHealth = value.toInt().coerceIn(0, maximumHealth)
+                    currentHealth = value.toInt().coerceIn(0, effectiveMaxHp)
                 }, onValueChangeFinished = {
                     AdventureVitalsStorage.save(context, character.id, currentHealth, maximumHealth)
-                }, valueRange = 0f..maximumHealth.toFloat())
+                }, valueRange = 0f..effectiveMaxHp.toFloat())
+                // Fast HP changes during tabletop play. Values are clamped and saved immediately.
+                listOf(-1, 1).forEach { direction ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        listOf(2, 5, 10, 15).forEach { amount ->
+                            OutlinedButton(
+                                onClick = {
+                                    currentHealth = (currentHealth + direction * amount).coerceIn(0, effectiveMaxHp)
+                                    AdventureVitalsStorage.save(context, character.id, currentHealth, maximumHealth)
+                                },
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 2.dp, vertical = 2.dp)
+                            ) { Text(if (direction < 0) "−$amount" else "+$amount") }
+                        }
+                    }
+                }
+                if (equipmentBonuses.maxHpBonus != 0) Text(
+                    "Бонус экипировки к максимуму: ${equipmentBonuses.maxHpBonus}",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 var maxText by remember(character.id) { mutableStateOf(maximumHealth.toString()) }
                 OutlinedTextField(value = maxText, onValueChange = { maxText = it.filter(Char::isDigit).take(5) },
                     label = { Text("Максимум здоровья") }, singleLine = true)
                 TextButton(onClick = {
                     maximumHealth = (maxText.toIntOrNull() ?: maximumHealth).coerceIn(1, 99999)
-                    currentHealth = currentHealth.coerceAtMost(maximumHealth)
+                    currentHealth = currentHealth.coerceAtMost((maximumHealth + equipmentBonuses.maxHpBonus).coerceAtLeast(1))
                     AdventureVitalsStorage.save(context, character.id, currentHealth, maximumHealth)
                 }) { Text("Сохранить максимум") }
             }
@@ -840,6 +811,37 @@ fun GameScreen(
             modifier = Modifier.fillMaxWidth()
         ) { Text("✧ Древо навыков") }
 
+        // Compact D&D essentials live on the existing character page, not in a second form.
+        var showArmorDetails by remember(character.id) { mutableStateOf(false) }
+        var armorClass by remember(character.id) { mutableIntStateOf(DndSheetStorage.load(context, character.id).armorClass) }
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(onClick = { showArmorDetails = !showArmorDetails }) {
+                    Text("🛡 Защита (КД): ${equipmentBonuses.armorClass(armorClass, (attributes["Ловкость"] ?: 10) + (talentBonuses["Ловкость"] ?: 0) + (equipmentBonuses.attributes["Ловкость"] ?: 0))}  ${if (showArmorDetails) "▴" else "▾"}")
+                }
+                if (showArmorDetails) {
+                    Text("Класс доспеха — число, которое атакующий должен достичь броском с бонусом, чтобы попасть по персонажу.",
+                        fontSize = 12.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedButton(onClick = {
+                            armorClass = (armorClass - 1).coerceAtLeast(0)
+                            val old = DndSheetStorage.load(context, character.id)
+                            DndSheetStorage.save(context, character.id, old.copy(armorClass = armorClass))
+                        }) { Text("−") }
+                        Text("  $armorClass  ", fontWeight = FontWeight.Bold)
+                        OutlinedButton(onClick = {
+                            armorClass = (armorClass + 1).coerceAtMost(99)
+                            val old = DndSheetStorage.load(context, character.id)
+                            DndSheetStorage.save(context, character.id, old.copy(armorClass = armorClass))
+                        }) { Text("+") }
+                    }
+                    Text("Базовый КД: $armorClass · экипировка: ${equipmentBonuses.acDescription()}",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Броня задаёт защиту, щит и магические предметы добавляют бонус. Снять предмет можно в разделе экипировки.", fontSize = 11.sp)
+                }
+            }
+        }
+
         // ЭКИПИРОВКА
 
         Card(Modifier.fillMaxWidth()) {
@@ -859,40 +861,73 @@ fun GameScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                equipmentSlots.forEach { slot ->
-                    val item = inventoryItems.firstOrNull {
-                        it.id == equipment[slot]
+                Text("В руках", fontWeight = FontWeight.SemiBold)
+                Text(
+                    "Меч, щит или другой предмет. Кисти с кольцами — ниже, они не занимают руки.",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    EquipmentHands.handSlots.forEach { hand ->
+                        val held = inventoryItems.firstOrNull { it.id == equipment[hand] }
+                        val opposite = if (hand == EquipmentHands.LEFT) EquipmentHands.RIGHT else EquipmentHands.LEFT
+                        val occupyingBoth = inventoryItems.firstOrNull { it.id == equipment[opposite] }
+                            ?.takeIf { EquipmentHands.isTwoHanded(it) }
+                        Column(
+                            modifier = Modifier.weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .clickable { selectedSlot = hand }
+                                .padding(10.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Text(if (hand == EquipmentHands.LEFT) "🫲" else "🫱", fontSize = 25.sp)
+                            Text(hand, fontWeight = FontWeight.SemiBold, fontSize = 12.sp,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(held?.name ?: occupyingBoth?.let { "Занята: ${it.name}" } ?: "Свободна",
+                                fontSize = 12.sp,
+                                color = if (held != null) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                textAlign = TextAlign.Center)
+                        }
                     }
+                }
 
+                equipmentSlots.forEach { slot ->
+                    val item = inventoryItems.firstOrNull { it.id == equipment[slot] }
                     Row(
-                        Modifier
-                            .fillMaxWidth()
+                        Modifier.fillMaxWidth()
                             .clip(RoundedCornerShape(12.dp))
                             .background(MaterialTheme.colorScheme.surfaceVariant)
-                            .clickable {
-                                selectedSlot = slot
-                            }
-                            .padding(
-                                horizontal = 14.dp,
-                                vertical = 11.dp
-                            ),
+                            .clickable { selectedSlot = slot }
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        Text(if (slot == "Руки") "Перчатки" else slot,
+                            modifier = Modifier.width(88.dp), fontWeight = FontWeight.SemiBold)
                         Text(
-                            slot,
-                            modifier = Modifier.width(88.dp),
-                            fontWeight = FontWeight.SemiBold
-                        )
-
-                        Text(
-                            item?.name ?: "Пусто",
-                            color = if (item == null) {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            } else {
-                                MaterialTheme.colorScheme.primary
-                            }
+                            (item?.name ?: "Пусто") + (item?.effects?.takeIf { it.isNotEmpty() }?.let {
+                                "  ✦ " + it.joinToString { effect -> effect.readable() }
+                            } ?: ""),
+                            color = if (item == null) MaterialTheme.colorScheme.onSurfaceVariant
+                                else MaterialTheme.colorScheme.primary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
+                }
+                val wornRings = ItemCatalogCategories.ringSlots.count { equipment[it] != null }
+                TextButton(onClick = { showRingSlots = !showRingSlots }) {
+                    Text("💍 Кисти и кольца ($wornRings/10) ${if (showRingSlots) "▴" else "▾"}")
+                }
+                if (showRingSlots) {
+                    RingHandsPicker(
+                        equipment = equipment.toMap(),
+                        inventory = inventoryItems.toList(),
+                        onChooseSlot = { selectedSlot = it }
+                    )
                 }
             }
         }
@@ -915,6 +950,10 @@ fun GameScreen(
                     color = MaterialTheme.colorScheme.primary
                 )
 
+                if (equipmentBonuses.attributes.isNotEmpty()) Text(
+                    "От снаряжения: " + equipmentBonuses.attributes.entries.joinToString { "${it.key} ${if (it.value >= 0) "+" else ""}${it.value}" },
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.primary
+                )
                 Row(
                     Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -922,7 +961,7 @@ fun GameScreen(
                     defaultAttributes.take(3).forEach { attribute ->
                         AttributeDiamond(
                             attribute,
-                            (attributes[attribute] ?: 10) + (talentBonuses[attribute] ?: 0),
+                            (attributes[attribute] ?: 10) + (talentBonuses[attribute] ?: 0) + (equipmentBonuses.attributes[attribute] ?: 0),
                             modifier = Modifier.weight(1f)
                         ) {
                             editingAttribute = attribute
@@ -939,7 +978,7 @@ fun GameScreen(
                     defaultAttributes.drop(3).forEach { attribute ->
                         AttributeDiamond(
                             attribute,
-                            (attributes[attribute] ?: 10) + (talentBonuses[attribute] ?: 0),
+                            (attributes[attribute] ?: 10) + (talentBonuses[attribute] ?: 0) + (equipmentBonuses.attributes[attribute] ?: 0),
                             modifier = Modifier.weight(1f)
                         ) {
                             editingAttribute = attribute
@@ -954,6 +993,115 @@ fun GameScreen(
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+        }
+
+        // All checks are grouped under six attributes, not shown as 24 permanent checkboxes.
+        var showChecks by remember(character.id) { mutableStateOf(false) }
+        var selectedCheckAttribute by remember(character.id) { mutableStateOf("Ловкость") }
+        var checkSheet by remember(character.id) { mutableStateOf(DndSheetStorage.load(context, character.id)) }
+        val checksByAttribute = mapOf(
+            "Сила" to listOf("Атлетика"),
+            "Ловкость" to listOf("Акробатика", "Ловкость рук", "Скрытность"),
+            "Телосложение" to emptyList(),
+            "Интеллект" to listOf("Анализ", "История", "Магия", "Природа", "Религия"),
+            "Мудрость" to listOf("Внимательность", "Выживание", "Медицина", "Проницательность", "Уход за животными"),
+            "Харизма" to listOf("Выступление", "Запугивание", "Обман", "Убеждение")
+        )
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = { showChecks = !showChecks }) {
+                    Text("🎯 Проверки и владения ${if (showChecks) "▴" else "▾"}")
+                }
+                if (showChecks) {
+                    Text("Выбери характеристику. Показываем только связанные с ней навыки.", fontSize = 12.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        defaultAttributes.take(3).forEach { attr ->
+                            OutlinedButton(onClick = { selectedCheckAttribute = attr }, modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(2.dp)) { Text(attr.take(3), fontSize = 11.sp) }
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        defaultAttributes.drop(3).forEach { attr ->
+                            OutlinedButton(onClick = { selectedCheckAttribute = attr }, modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(2.dp)) { Text(attr.take(3), fontSize = 11.sp) }
+                        }
+                    }
+                    val statScore = (attributes[selectedCheckAttribute] ?: 10) + (talentBonuses[selectedCheckAttribute] ?: 0) + (equipmentBonuses.attributes[selectedCheckAttribute] ?: 0)
+                    val statBonus = Math.floorDiv(statScore - 10, 2)
+                    val mastery = checkSheet.proficiencyOverride ?: (2 + (character.level.coerceIn(1, 20) - 1) / 4)
+                    Text("$selectedCheckAttribute · бонус характеристики ${if (statBonus >= 0) "+" else ""}$statBonus · мастерство +$mastery",
+                        fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    val hasSave = selectedCheckAttribute in checkSheet.saveProficiencies
+                    val saveBonus = equipmentBonuses.saves[selectedCheckAttribute] ?: 0
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = hasSave, onCheckedChange = { checked ->
+                            checkSheet = checkSheet.copy(saveProficiencies =
+                                if (checked) checkSheet.saveProficiencies + selectedCheckAttribute
+                                else checkSheet.saveProficiencies - selectedCheckAttribute)
+                            DndSheetStorage.save(context, character.id, checkSheet)
+                        })
+                        Text("Спасбросок: ${if (statBonus + (if (hasSave) mastery else 0) + saveBonus >= 0) "+" else ""}${statBonus + (if (hasSave) mastery else 0) + saveBonus}", fontSize = 13.sp)
+                    }
+                    (checksByAttribute[selectedCheckAttribute] ?: emptyList()).forEach { skill ->
+                        val proficient = skill in checkSheet.skillProficiencies
+                        val total = statBonus + (if (proficient) mastery else 0) + (equipmentBonuses.skills[skill] ?: 0)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = proficient, onCheckedChange = { checked ->
+                                checkSheet = checkSheet.copy(skillProficiencies =
+                                    if (checked) checkSheet.skillProficiencies + skill else checkSheet.skillProficiencies - skill)
+                                DndSheetStorage.save(context, character.id, checkSheet)
+                            })
+                            Text("$skill: ${if (total >= 0) "+" else ""}$total", fontSize = 13.sp)
+                        }
+                    }
+                    Text("Отмечай владения, а не вводи бонусы вручную. Итог рассчитывается автоматически. Бросок кубика остаётся настоящим.",
+                        fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+
+        // КОШЕЛЁК: shown in the existing character screen, not a separate page.
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Column {
+                        Text("🪙 Кошелёк", fontWeight = FontWeight.Bold)
+                        Text(RpgCurrency.display(localWalletCopper),
+                            style = MaterialTheme.typography.bodyMedium)
+                    }
+                    TextButton(onClick = { walletExpanded = !walletExpanded }) {
+                        Text(if (walletExpanded) "Свернуть" else "Изменить")
+                    }
+                }
+                if (walletExpanded) {
+                    Text("Монеты синхронизируются с балансом магазина. Цены магазинов указаны в золотых.",
+                        style = MaterialTheme.typography.bodySmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(100 to "Золото", 10 to "Серебро", 1 to "Медь").forEach { (value, label) ->
+                            FilterChip(selected = walletDenomination == value,
+                                onClick = { walletDenomination = value }, label = { Text(label) })
+                        }
+                    }
+                    OutlinedTextField(value = walletAdjustment,
+                        onValueChange = { walletAdjustment = it.filter(Char::isDigit).take(9) },
+                        label = { Text("Количество монет") }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth())
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        val value = (walletAdjustment.toLongOrNull() ?: 0L) * walletDenomination
+                        OutlinedButton(enabled = value > 0 && value <= localWalletCopper,
+                            onClick = {
+                                localWalletCopper = CharacterStorage.changeWallet(context, character.id, -value)
+                                walletAdjustment = ""
+                            }) { Text("− Списать") }
+                        OutlinedButton(enabled = value > 0,
+                            onClick = {
+                                localWalletCopper = CharacterStorage.changeWallet(context, character.id, value)
+                                walletAdjustment = ""
+                            }) { Text("+ Добавить") }
+                    }
+                }
             }
         }
 
@@ -1031,7 +1179,8 @@ fun GameScreen(
         BoxWithConstraints(
             Modifier
                 .fillMaxWidth()
-                .height(220.dp)
+                // Two columns accommodate up to eight items (including bound journal/scroll).
+                .height(if (inventoryItems.size > 6) 280.dp else 220.dp)
                 .clip(RoundedCornerShape(20.dp))
                 .background(MaterialTheme.colorScheme.surfaceVariant)
                 .border(
@@ -1055,12 +1204,19 @@ fun GameScreen(
                 (maxHeight - itemHeight).toPx().coerceAtLeast(0f)
             }
 
-            LaunchedEffect(inventoryItems.size, maxX, maxY) {
-                inventoryItems.forEach { item ->
+            val itemWidthPx = with(density) { itemWidth.toPx() }
+            val itemHeightPx = with(density) { itemHeight.toPx() }
+            val gapPx = with(density) { 8.dp.toPx() }
+            val columns = if (maxX >= itemWidthPx + gapPx) 2 else 1
+
+            LaunchedEffect(inventoryItems.map { it.id }, maxX, maxY) {
+                // Use predictable, non-overlapping starting positions instead of random
+                // offsets. Previously placed or dragged items are not reset here.
+                inventoryItems.forEachIndexed { index, item ->
                     if (positions[item.id] == null) {
                         positions[item.id] = Offset(
-                            Random.nextFloat() * maxX,
-                            Random.nextFloat() * maxY
+                            ((index % columns) * (itemWidthPx + gapPx)).coerceAtMost(maxX),
+                            ((index / columns) * (itemHeightPx + gapPx)).coerceAtMost(maxY)
                         )
                     }
                 }
@@ -1216,45 +1372,106 @@ fun GameScreen(
     }
 
     selectedInventoryItem?.let { item ->
+        var editingItem by remember(item.id) { mutableStateOf(false) }
+        var draftName by remember(item.id) { mutableStateOf(item.name) }
+        var draftDescription by remember(item.id) { mutableStateOf(item.description) }
+        var draftQuantity by remember(item.id) { mutableStateOf(item.quantity.ifBlank { "1" }) }
+        var draftCategory by remember(item.id) { mutableStateOf(item.category) }
+        var draftEffects by remember(item.id) { mutableStateOf(item.effects) }
+        var showItemEffects by remember(item.id) { mutableStateOf(false) }
+        val bound = CharacterStorage.isBoundItem(item)
+        fun saveEdited(updated: InventoryItem) {
+            val index = inventoryItems.indexOfFirst { it.id == item.id }
+            if (index >= 0) {
+                inventoryItems[index] = updated
+                selectedInventoryItem = updated
+                saveInventory()
+            }
+        }
         AlertDialog(
             onDismissRequest = { selectedInventoryItem = null },
-            title = { Text(item.name) },
+            title = { Text(if (editingItem) "Редактирование предмета" else item.name) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    if (item.quantity.isNotBlank()) Text("Количество: ${item.quantity}")
-                    Text("Категория: ${item.category}")
-                    var changeCategoryMenu by remember(item.id) { mutableStateOf(false) }
-                    Box {
-                        TextButton(onClick={changeCategoryMenu=true}){Text("Изменить категорию")}
-                        DropdownMenu(expanded=changeCategoryMenu,onDismissRequest={changeCategoryMenu=false}) {
-                            listOf("Оружие","Броня","Расходники","Материалы","Квестовые","Инструменты","Прочее").forEach { category ->
-                                DropdownMenuItem(text={Text(category)},onClick={
-                                    val index=inventoryItems.indexOfFirst { it.id==item.id }
-                                    if(index>=0) {
-                                        val newer=item.copy(category=category)
-                                        inventoryItems[index]=newer
-                                        selectedInventoryItem=newer
-                                        saveInventory()
-                                    }
-                                    changeCategoryMenu=false
-                                })
+                Column(Modifier.heightIn(max = 410.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (!bound) {
+                        Text("Количество", style = MaterialTheme.typography.labelLarge)
+                        Row(horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            verticalAlignment = Alignment.CenterVertically) {
+                            listOf(-5,-1,1,5).forEach { delta ->
+                                OutlinedButton(onClick = {
+                                    val before = item.quantity.toIntOrNull() ?: 1
+                                    val newer = item.copy(quantity = (before + delta).coerceIn(0, 1_000_000).toString())
+                                    saveEdited(newer)
+                                }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)) {
+                                    Text(if (delta > 0) "+$delta" else "$delta")
+                                }
                             }
                         }
+                        Text("Сейчас: ${item.quantity.ifBlank { "1" }} · 0 оставляет предмет в сумке",
+                            style = MaterialTheme.typography.bodySmall)
                     }
-                    if (showInventoryDetails) {
-                        Text(item.description.ifBlank { "Описание не добавлено." })
+                    if (!bound) {
+                        TextButton(onClick = { showItemEffects = !showItemEffects }) {
+                            Text("✦ Свойства и эффекты ${if (showItemEffects) "▴" else "▾"}")
+                        }
+                        if (showItemEffects) {
+                            ItemEffectsEditor(draftEffects, onChange = { newEffects ->
+                                draftEffects = newEffects
+                                saveEdited(item.copy(effects = newEffects))
+                            })
+                        }
+                    }
+                    if (editingItem && !bound) {
+                        OutlinedTextField(draftName, { draftName = it },
+                            label = { Text("Название") }, singleLine = true)
+                        OutlinedTextField(draftDescription, { draftDescription = it },
+                            label = { Text("Описание") }, minLines = 2)
+                        OutlinedTextField(draftQuantity, { draftQuantity = it.filter(Char::isDigit).take(7) },
+                            label = { Text("Точное количество") }, singleLine = true)
+                        var changeCategoryMenu by remember { mutableStateOf(false) }
+                        Box {
+                            OutlinedButton(onClick = { changeCategoryMenu = true }) { Text("Категория: $draftCategory") }
+                            DropdownMenu(expanded = changeCategoryMenu, onDismissRequest = { changeCategoryMenu = false }) {
+                                ItemCatalogCategories.all.forEach { category ->
+                                    DropdownMenuItem(text = { Text(category) }, onClick = {
+                                        draftCategory = category; changeCategoryMenu = false
+                                    })
+                                }
+                            }
+                        }
                     } else {
-                        Text("Информация о предмете скрыта.")
+                        Text("Категория: ${item.category}", style = MaterialTheme.typography.bodySmall)
+                        Text(item.description.ifBlank { "Описание отсутствует" })
+                        if (item.effects.isNotEmpty()) Text(
+                            item.effects.joinToString(" · ") { it.readable() },
+                            fontSize = 12.sp, color = MaterialTheme.colorScheme.primary
+                        )
+                        if (bound) Text("Системный предмет нельзя изменить или удалить.",
+                            style = MaterialTheme.typography.bodySmall)
                     }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showInventoryDetails = !showInventoryDetails }) {
-                    Text(if (showInventoryDetails) "Скрыть описание" else "О предмете")
+                if (editingItem && !bound) {
+                    TextButton(enabled = draftName.isNotBlank() && draftQuantity.toIntOrNull() != null,
+                        onClick = {
+                            saveEdited(item.copy(name = draftName.trim(), description = draftDescription.trim(),
+                                quantity = draftQuantity, category = draftCategory, effects = draftEffects))
+                            editingItem = false
+                        }) { Text("Сохранить") }
+                } else if (!bound) {
+                    TextButton(onClick = {
+                        draftName = item.name; draftDescription = item.description
+                        draftQuantity = item.quantity.ifBlank { "1" }; draftCategory = item.category
+                        editingItem = true
+                    }) { Text("Изменить") }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { selectedInventoryItem = null }) { Text("Закрыть") }
+                TextButton(onClick = { if (editingItem) editingItem = false else selectedInventoryItem = null }) {
+                    Text(if (editingItem) "Отмена" else "Закрыть")
+                }
             }
         )
     }
@@ -1271,6 +1488,7 @@ fun GameScreen(
             },
             text = {
                 Column(
+                    modifier = Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     TextButton(onClick = { showInventoryCatalog = true }) { Text("📚 Выбрать предмет из библиотеки") }
@@ -1295,7 +1513,7 @@ fun GameScreen(
                     Box {
                         OutlinedButton(onClick={categoryMenuOpen=true}){Text(itemCategory)}
                         DropdownMenu(expanded=categoryMenuOpen,onDismissRequest={categoryMenuOpen=false}) {
-                            listOf("Оружие","Броня","Расходники","Материалы","Квестовые","Инструменты","Прочее").forEach { c ->
+                            ItemCatalogCategories.all.forEach { c ->
                                 DropdownMenuItem(text={Text(c)},onClick={itemCategory=c;categoryMenuOpen=false})
                             }
                         }
@@ -1327,27 +1545,27 @@ fun GameScreen(
             confirmButton = {
                 TextButton(
                     enabled = itemName.isNotBlank() &&
-                            (!hasQuantity || itemQuantity.isNotBlank()),
+                            (!hasQuantity || (itemQuantity.toLongOrNull() ?: -1L) in 0..1_000_000),
                     onClick = {
-                        inventoryItems.add(
-                            InventoryItem(
-                                name = itemName.trim(),
-                                description = itemDescription.trim(),
-                                category = itemCategory,
-                                quantity = if (hasQuantity) {
-                                    itemQuantity.trim()
-                                } else {
-                                    ""
-                                }
+                        val denomination = CharacterStorage.currencyCopperValue(itemName.trim())
+                        val amount = if (hasQuantity) itemQuantity.trim().toLongOrNull() else 1L
+                        if (denomination > 0 && amount != null && amount in 1..1_000_000) {
+                            localWalletCopper = CharacterStorage.changeWallet(context, character.id,
+                                denomination.toLong() * amount)
+                        } else {
+                            inventoryItems.add(
+                                InventoryItem(name = itemName.trim(), description = itemDescription.trim(),
+                                    category = itemCategory, quantity = if (hasQuantity) itemQuantity.trim() else "",
+                                    effects = if (itemPresetEffects.isNotEmpty()) itemPresetEffects else ItemEffectEngine.template(itemName.trim()))
                             )
-                        )
-
-                        saveInventory()
+                            saveInventory()
+                        }
                         onEvent("Добавил предмет «${itemName.trim()}»")
                         showAddDialog = false
 
                         itemName = ""
                         itemDescription = ""
+                        itemPresetEffects = emptyList()
                         itemQuantity = ""
                         itemCategory = "Прочее"
                         hasQuantity = false
@@ -1373,7 +1591,9 @@ fun GameScreen(
         entries = RpgEquipmentAbilitiesCatalog.items,
         onSelect = { chosen ->
             itemName = chosen.name
-            itemDescription = chosen.description
+            itemDescription = ItemEffectEngine.templateDescription(chosen.name, chosen.description)
+            itemPresetEffects = ItemEffectEngine.template(chosen.name)
+            itemCategory = chosen.group
             showInventoryCatalog = false
         },
         onDismiss = { showInventoryCatalog = false }
@@ -1385,39 +1605,73 @@ fun GameScreen(
         val currentlyEquipped = inventoryItems.firstOrNull {
             it.id == equipment[slot]
         }
+        var ringDetailsId by remember(slot) { mutableStateOf<Long?>(null) }
+        val isFingerSlot = slot in ItemCatalogCategories.ringSlots
+        val availableForSlot = inventoryItems.filter { item ->
+            !CharacterStorage.isBoundItem(item) &&
+                (item.quantity.toIntOrNull() ?: 1) > 0 &&
+                equipment.entries.none { it.key != slot && it.value == item.id } &&
+                EquipmentHands.canEquip(slot, item, equipment.toMap(), inventoryItems.toList())
+        }
 
         AlertDialog(
             onDismissRequest = {
                 selectedSlot = null
             },
             title = {
-                Text("Слот: $slot")
+                Text(if (isFingerSlot) ItemCatalogCategories.fingerLabel(slot) else "Слот: $slot")
             },
             text = {
-                Column {
-                    Text("Выбери любой предмет из инвентаря:")
+                Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())) {
+                    Text(if (isFingerSlot) "Выбери кольцо для этого пальца:"
+                        else if (slot in EquipmentHands.handSlots) "Выбери, что держать в руке:"
+                        else "Выбери предмет из инвентаря:")
+                    if (slot in EquipmentHands.handSlots) {
+                        Text("Двуручное оружие требует обе свободные руки; два щита одновременно нельзя.",
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (isFingerSlot) {
+                        Text("Одно кольцо на палец. Для одинаковых колец нужны отдельные экземпляры.",
+                            style = MaterialTheme.typography.bodySmall)
+                        currentlyEquipped?.let { ring ->
+                            Text("Надето: ${ring.name}", fontWeight = FontWeight.SemiBold)
+                            if (ring.description.isNotBlank()) Text(ring.description, fontSize = 12.sp)
+                            ring.effects.forEach { Text("✦ ${it.readable()}", fontSize = 12.sp) }
+                            HorizontalDivider()
+                        }
+                    }
 
                     if (inventoryItems.isEmpty()) {
                         Text("Инвентарь пока пуст.")
                     }
 
-                    inventoryItems.forEach { item ->
-                        TextButton(
-                            onClick = {
-                                equipment[slot] = item.id
-                                saveEquipment()
-                                selectedSlot = null
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(
-                                item.name +
-                                        if (item.quantity.isNotBlank()) {
-                                            " (${item.quantity})"
-                                        } else {
-                                            ""
-                                        }
-                            )
+                    if (availableForSlot.isEmpty()) {
+                        Text(if (isFingerSlot)
+                            "В инвентаре нет свободных колец. Добавь новое кольцо в инвентарь."
+                        else "Подходящих предметов нет.",
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                    availableForSlot.forEach { item ->
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(
+                                onClick = {
+                                    equipment[slot] = item.id
+                                    saveEquipment()
+                                    selectedSlot = null
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(item.name + if (item.quantity.isNotBlank()) " (×${item.quantity})" else "",
+                                    maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                            if (isFingerSlot) TextButton(onClick = {
+                                ringDetailsId = if (ringDetailsId == item.id) null else item.id
+                            }) { Text("ⓘ") }
+                        }
+                        if (isFingerSlot && ringDetailsId == item.id) {
+                            if (item.description.isNotBlank()) Text(item.description, fontSize = 12.sp)
+                            if (item.effects.isEmpty()) Text("Нет игровых бонусов", fontSize = 12.sp)
+                            else item.effects.forEach { Text("✦ ${it.readable()}", fontSize = 12.sp) }
                         }
                     }
                 }
@@ -1547,6 +1801,14 @@ fun AbilitiesScreen(
         }
     }
 
+    // Shares storage with the previous D&D sheet, so existing slot counts are retained.
+    var magic by remember(character.id) { mutableStateOf(DndSheetStorage.load(context, character.id)) }
+    var showMagicSetup by remember(character.id) { mutableStateOf(false) }
+    fun updateMagic(next: DndSheet) {
+        magic = next
+        DndSheetStorage.save(context, character.id, next)
+    }
+
     var inCombat by remember(character.id) {
         mutableStateOf(CharacterStorage.loadCombatState(context, character.id))
     }
@@ -1561,6 +1823,7 @@ fun AbilitiesScreen(
     var hasActivator by remember { mutableStateOf(false) }
     var activatorDescription by remember { mutableStateOf("") }
     var hasPassive by remember { mutableStateOf(false) }
+    var spellLevel by remember { mutableIntStateOf(0) }
     var passiveDescription by remember { mutableStateOf("") }
 
     fun saveAbilities() {
@@ -1588,6 +1851,60 @@ fun AbilitiesScreen(
             character.name,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("✦ Магические ячейки", modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                    TextButton(onClick = { showMagicSetup = !showMagicSetup }) {
+                        Text(if (showMagicSetup) "Скрыть" else "Настроить")
+                    }
+                }
+                Text("Закрашенный круг — ячейка доступна; пустой — уже потрачена.",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val configured = (0..8).filter { magic.spellSlotsMax.getOrElse(it) { 0 } > 0 }
+                if (configured.isEmpty() && !showMagicSetup) {
+                    Text("Ячейки ещё не настроены. Нажми «Настроить», если герой использует магию.", fontSize = 13.sp)
+                }
+                (if (showMagicSetup) (0..8).toList() else configured).forEach { levelIndex ->
+                    val maximum = magic.spellSlotsMax.getOrElse(levelIndex) { 0 }
+                    val left = magic.spellSlotsRemaining.getOrElse(levelIndex) { 0 }.coerceIn(0, maximum)
+                    if (maximum > 0 || showMagicSetup) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("${levelIndex + 1} круг", modifier = Modifier.weight(1f), fontSize = 13.sp)
+                            Text("$left/$maximum", fontSize = 12.sp)
+                            if (showMagicSetup) {
+                                OutlinedButton(onClick = {
+                                    val maxes = magic.spellSlotsMax.toMutableList()
+                                    val remaining = magic.spellSlotsRemaining.toMutableList()
+                                    maxes[levelIndex] = (maximum - 1).coerceAtLeast(0)
+                                    remaining[levelIndex] = remaining[levelIndex].coerceAtMost(maxes[levelIndex])
+                                    updateMagic(magic.copy(spellSlotsMax = maxes, spellSlotsRemaining = remaining))
+                                }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("−") }
+                                OutlinedButton(onClick = {
+                                    val maxes = magic.spellSlotsMax.toMutableList()
+                                    val remaining = magic.spellSlotsRemaining.toMutableList()
+                                    maxes[levelIndex] = (maximum + 1).coerceAtMost(20)
+                                    remaining[levelIndex] = (left + 1).coerceAtMost(maxes[levelIndex])
+                                    updateMagic(magic.copy(spellSlotsMax = maxes, spellSlotsRemaining = remaining))
+                                }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("+") }
+                            }
+                        }
+                        if (maximum > 0) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                repeat(maximum.coerceAtMost(20)) { idx ->
+                                    Box(Modifier.size(15.dp).clip(CircleShape)
+                                        .background(if (idx < left) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant)
+                                        .border(1.dp, MaterialTheme.colorScheme.primary, CircleShape))
+                                }
+                            }
+                        }
+                    }
+                }
+                if (showMagicSetup) Text("Количество ячеек задаётся вручную по правилам вашего персонажа. Потраченные восстанавливаются при начале нового дня после лагеря.",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
 
         Button(
             onClick = {
@@ -1635,7 +1952,11 @@ fun AbilitiesScreen(
         }
 
         abilities.forEach { ability ->
-            val isAvailable = inCombat && !ability.isPassive && !ability.isUsed
+            val isMagic = ability.spellLevel != 0
+            val spellIndex = ability.spellLevel - 1
+            val hasSlot = ability.spellLevel == -1 ||
+                (spellIndex in 0..8 && magic.spellSlotsRemaining.getOrElse(spellIndex) { 0 } > 0)
+            val isAvailable = !ability.isPassive && if (isMagic) hasSlot else inCombat && !ability.isUsed
             val hasActivatorDescription = ability.activatorDescription.isNotBlank()
 
             Card(
@@ -1680,6 +2001,8 @@ fun AbilitiesScreen(
                     } else {
                         Text(
                             when {
+                                isMagic && !hasSlot -> "Не хватает магических ячеек"
+                                isMagic -> if (ability.spellLevel == -1) "Заговор · без ячеек" else "Магия · ${ability.spellLevel} круг"
                                 !inCombat -> "Доступна во время боя"
                                 ability.isUsed -> "Использована — перезарядка"
                                 else -> "Готова к использованию"
@@ -1695,9 +2018,19 @@ fun AbilitiesScreen(
                         Button(
                             onClick = {
                                 val index = abilities.indexOfFirst { it.id == ability.id }
-                                if (index != -1 && inCombat && !abilities[index].isUsed) {
-                                    abilities[index] = abilities[index].copy(isUsed = true)
-                                    saveAbilities()
+                                if (index != -1 && isAvailable && !deleteMode) {
+                                    if (isMagic) {
+                                        if (spellIndex in 0..8) {
+                                            val remaining = magic.spellSlotsRemaining.toMutableList()
+                                            if (remaining[spellIndex] <= 0) return@Button
+                                            remaining[spellIndex] -= 1
+                                            updateMagic(magic.copy(spellSlotsRemaining = remaining))
+                                        }
+                                        // Magical abilities don't go on cooldown while slots remain.
+                                    } else {
+                                        abilities[index] = abilities[index].copy(isUsed = true)
+                                        saveAbilities()
+                                    }
                                     onEvent("Использовал способность «${ability.name}»")
                                 }
                             },
@@ -1710,6 +2043,8 @@ fun AbilitiesScreen(
                         ) {
                             Text(
                                 when {
+                                    isMagic && !hasSlot -> "Нет магических ячеек"
+                                    isMagic -> "Применить магию"
                                     !inCombat -> "Доступна только в бою"
                                     ability.isUsed -> "Использована"
                                     else -> "Использовать"
@@ -1728,7 +2063,7 @@ fun AbilitiesScreen(
                             color = MaterialTheme.colorScheme.secondary
                         )
                         Text(ability.activatorDescription, fontSize = 13.sp)
-                        if (!ability.isPassive) {
+                        if (!ability.isPassive && !isMagic) {
                             OutlinedButton(
                                 onClick = {
                                     val index = abilities.indexOfFirst { it.id == ability.id }
@@ -1884,6 +2219,30 @@ fun AbilitiesScreen(
                         )
                     }
 
+                    if (!hasPassive) {
+                        Divider()
+                        Text("Тип применения", fontWeight = FontWeight.Bold)
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            listOf(0 to "Обычная", -1 to "Заговор", 1 to "Заклинание").forEach { (level, label) ->
+                                OutlinedButton(onClick = { spellLevel = level }, modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        containerColor = if ((spellLevel > 0 && level == 1) || spellLevel == level)
+                                            MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface)) {
+                                    Text(label, fontSize = 11.sp)
+                                }
+                            }
+                        }
+                        if (spellLevel > 0) {
+                            Text("Круг заклинания · $spellLevel", fontSize = 13.sp)
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                OutlinedButton(onClick = { spellLevel = (spellLevel - 1).coerceAtLeast(1) },
+                                    modifier = Modifier.weight(1f)) { Text("−") }
+                                OutlinedButton(onClick = { spellLevel = (spellLevel + 1).coerceAtMost(9) },
+                                    modifier = Modifier.weight(1f)) { Text("+") }
+                            }
+                        }
+                    }
+
                     Text(
                         "Активатор и пассивный эффект можно указать независимо друг от друга. Пассивная способность не требует нажатия.",
                         fontSize = 11.sp,
@@ -1902,12 +2261,14 @@ fun AbilitiesScreen(
                                 name = abilityName.trim(),
                                 description = abilityDescription.trim(),
                                 activatorDescription = if (hasActivator) activatorDescription.trim() else "",
-                                passiveDescription = if (hasPassive) passiveDescription.trim() else ""
+                                passiveDescription = if (hasPassive) passiveDescription.trim() else "",
+                                spellLevel = if (hasPassive) 0 else spellLevel
                             )
                         )
                         saveAbilities()
                         onEvent("Добавил способность «${abilityName.trim()}»")
                         showAddDialog = false
+                        spellLevel = 0
                     }
                 ) {
                     Text("Добавить")

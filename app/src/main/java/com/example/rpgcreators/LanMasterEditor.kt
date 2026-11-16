@@ -35,6 +35,9 @@ internal fun MasterObservationDialog(
     var checked by remember(playerId) { mutableStateOf(false) }
     var feedback by remember(playerId) { mutableStateOf("") }
     var identityCatalog by remember(playerId) { mutableStateOf("") }
+    var draftItemEffects by remember(playerId) { mutableStateOf(emptyList<ItemEffect>()) }
+    var draftItemCategory by remember(playerId) { mutableStateOf("Прочее") }
+    var showMasterRings by remember(playerId) { mutableStateOf(false) }
 
     fun send(operation: String, data: JSONObject, description: String) {
         feedback = if (onEdit(operation, data, description)) "Изменение отправлено игроку" else
@@ -121,16 +124,22 @@ internal fun MasterObservationDialog(
                                 editing = "item"; identifier = item.optLong("id", 0)
                                 fieldName = item.optString("name"); fieldValue = item.optString("quantity")
                                 extra = item.optString("description")
+                                draftItemCategory = item.optString("category", "Прочее")
+                                draftItemEffects = if (item.has("effects"))
+                                    ItemEffectEngine.fromJson(item.optJSONArray("effects"))
+                                else ItemEffectEngine.template(item.optString("name"))
                             }, modifier = Modifier.fillMaxWidth()) {
                                 Text("${item.optString("name")} ${item.optString("quantity")}  ✎", modifier = Modifier.fillMaxWidth())
                             }
                         }
                         TextButton(onClick = {
                             editing = "item"; identifier = 0L; fieldName = ""; fieldValue = ""; extra = ""
+                            draftItemEffects = emptyList()
+                            draftItemCategory = "Прочее"
                         }) { Text("＋ Добавить предмет") }
                         HorizontalDivider()
                         Text("Экипировка", fontWeight = FontWeight.Bold)
-                        listOf("Голова", "Тело", "Руки", "Ноги", "Голени").forEach { slot ->
+                        (EquipmentHands.handSlots + listOf("Голова", "Тело", "Руки", "Ноги", "Голени", "Аксессуар")).forEach { slot ->
                             val equippedId = equipment?.optLong(slot, 0L) ?: 0L
                             var equippedName = "Пусто"
                             for (i in 0 until inventory.length()) {
@@ -143,8 +152,41 @@ internal fun MasterObservationDialog(
                             TextButton(onClick = {
                                 editing = "equipment"; fieldName = slot; identifier = equippedId
                             }, modifier = Modifier.fillMaxWidth()) {
-                                Text("$slot: $equippedName  ✎", modifier = Modifier.fillMaxWidth())
+                                Text("${if (slot == "Руки") "Перчатки" else slot}: $equippedName  ✎", modifier = Modifier.fillMaxWidth())
                             }
+                        }
+                        val masterRings = ItemCatalogCategories.ringSlots.count { equipment?.optLong(it, 0L) != 0L } +
+                            ItemCatalogCategories.legacyRingSlots.count { equipment?.optLong(it, 0L) != 0L }
+                        TextButton(onClick = { showMasterRings = !showMasterRings }) {
+                            Text("💍 Кисти и кольца ($masterRings/10) ${if (showMasterRings) "▴" else "▾"}")
+                        }
+                        if (showMasterRings) {
+                            val ringEquipment = buildMap<String, Long> {
+                                val keys = equipment?.keys()
+                                while (keys != null && keys.hasNext()) {
+                                    val key = keys.next()
+                                    put(key, equipment?.optLong(key, 0L) ?: 0L)
+                                }
+                            }
+                            val ringInventory = (0 until inventory.length()).mapNotNull { index ->
+                                inventory.optJSONObject(index)?.let { item ->
+                                    InventoryItem(
+                                        id = item.optLong("id", 0L), name = item.optString("name"),
+                                        quantity = item.optString("quantity", "1"),
+                                        description = item.optString("description"),
+                                        category = item.optString("category", "Прочее"),
+                                        effects = ItemEffectEngine.fromJson(item.optJSONArray("effects"))
+                                    )
+                                }
+                            }
+                            RingHandsPicker(
+                                equipment = ItemCatalogCategories.migrateRingSlots(ringEquipment),
+                                inventory = ringInventory,
+                                onChooseSlot = { slot ->
+                                    editing = "equipment"; fieldName = slot
+                                    identifier = ItemCatalogCategories.migrateRingSlots(ringEquipment)[slot] ?: 0L
+                                }
+                            )
                         }
                     } else if (tab == "tree") {
                         val currentCharacter = Character(
@@ -160,11 +202,16 @@ internal fun MasterObservationDialog(
                         val points = TalentState(learned, pointsGranted)
                         val allNodes = SkillTreeEngine.nodes(currentCharacter)
                         Text("Уровень ${currentCharacter.level}/20 · Потрачено ${SkillTreeEngine.spent(allNodes, points)}", fontWeight = FontWeight.Bold)
-                        Text("Доступно очков: ${SkillTreeEngine.totalPoints(currentCharacter, points) - SkillTreeEngine.spent(allNodes, points)}")
+                        Text("Доступно очков: ${SkillTreeEngine.remainingPoints(currentCharacter, points, allNodes)}" +
+                            if (currentCharacter.buildVersion >= 2) " · Лимит: ${SkillTreeEngine.maxPoints(currentCharacter)}" else "")
                         Text("После 20 уровня: ${currentCharacter.prestigePoints} дополнительных очков")
+                        val pointsAtCap = currentCharacter.buildVersion >= 2 &&
+                            SkillTreeEngine.totalPoints(currentCharacter, points) >= SkillTreeEngine.maxPoints(currentCharacter)
                         Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                            TextButton(onClick = { send("skill_points", JSONObject().put("value", 1), "Выдал 1 очко развития") }) { Text("+1 очко") }
-                            TextButton(onClick = { send("skill_points", JSONObject().put("value", 5), "Выдал 5 очков развития") }) { Text("+5 очков") }
+                            TextButton(enabled = !pointsAtCap,
+                                onClick = { send("skill_points", JSONObject().put("value", 1), "Запросил +1 очко развития") }) { Text("+1 очко") }
+                            TextButton(enabled = !pointsAtCap,
+                                onClick = { send("skill_points", JSONObject().put("value", 5), "Запросил до +5 очков развития") }) { Text("+5 очков") }
                             TextButton(onClick = { send("skill_reset", JSONObject(), "Сбросил древо игрока") }) { Text("Сброс") }
                         }
                         Text("Изученные навыки", fontWeight = FontWeight.Bold)
@@ -229,6 +276,19 @@ internal fun MasterObservationDialog(
                             MasterEditTextField(fieldName, { fieldName = it.take(100) }, "Название предмета")
                             MasterEditTextField(fieldValue, { fieldValue = it.take(60) }, "Количество")
                             MasterEditTextField(extra, { extra = it.take(500) }, "Описание")
+                            var catMenu by remember { mutableStateOf(false) }
+                            Box {
+                                OutlinedButton(onClick = { catMenu = true }) { Text("Категория: $draftItemCategory") }
+                                DropdownMenu(expanded = catMenu, onDismissRequest = { catMenu = false }) {
+                                    ItemCatalogCategories.all.forEach { option ->
+                                        DropdownMenuItem(text = { Text(option) }, onClick = {
+                                            draftItemCategory = option; catMenu = false
+                                        })
+                                    }
+                                }
+                            }
+                            Text("Свойства этого предмета", fontWeight = FontWeight.SemiBold)
+                            ItemEffectsEditor(draftItemEffects, onChange = { draftItemEffects = it })
                         }
                         "ability" -> {
                             TextButton(onClick = { identityCatalog = "ability" }) { Text("📚 Способности из базы") }
@@ -247,7 +307,38 @@ internal fun MasterObservationDialog(
                             for (i in 0 until inventory.length()) {
                                 val item = inventory.optJSONObject(i) ?: continue
                                 val id = item.optLong("id", 0L)
-                                RadioButtonRow(item.optString("name"), identifier == id) { identifier = id }
+                                val candidate = InventoryItem(id = id, name = item.optString("name"),
+                                    quantity = item.optString("quantity", "1"),
+                                    category = item.optString("category", "Прочее"),
+                                    effects = if (item.has("effects"))
+                                        ItemEffectEngine.fromJson(item.optJSONArray("effects"))
+                                    else ItemEffectEngine.template(item.optString("name")))
+                                val usedInAnotherSlot = equipment?.let { equipped ->
+                                    val keys = equipped.keys()
+                                    var occupied = false
+                                    while (keys.hasNext()) {
+                                        val otherSlot = keys.next()
+                                        if (otherSlot != fieldName && equipped.optLong(otherSlot, 0L) == id)
+                                            occupied = true
+                                    }
+                                    occupied
+                                } ?: false
+                                if (EquipmentHands.canEquip(fieldName, candidate,
+                                        buildMap {
+                                            val keys = equipment?.keys()
+                                            while (keys != null && keys.hasNext()) {
+                                                val key = keys.next()
+                                                put(key, equipment?.optLong(key, 0L) ?: 0L)
+                                            }
+                                        }, (0 until inventory.length()).mapNotNull { idx ->
+                                            inventory.optJSONObject(idx)?.let { obj -> InventoryItem(
+                                                id = obj.optLong("id", 0L), name = obj.optString("name"),
+                                                category = obj.optString("category", "Прочее"),
+                                                effects = ItemEffectEngine.fromJson(obj.optJSONArray("effects"))) }
+                                        }) &&
+                                    (candidate.quantity.toIntOrNull() ?: 1) > 0 && !usedInAnotherSlot) {
+                                    RadioButtonRow(item.optString("name"), identifier == id) { identifier = id }
+                                }
                             }
                         }
                     }
@@ -292,7 +383,9 @@ internal fun MasterObservationDialog(
                         "attribute" -> send("attribute", JSONObject().put("name", fieldName).put("value", numeric),
                             "Изменил характеристику «$fieldName»: $numeric")
                         "item" -> send("item_save", JSONObject().put("id", identifier)
-                            .put("name", fieldName).put("quantity", fieldValue).put("description", extra),
+                            .put("name", fieldName).put("quantity", fieldValue).put("description", extra)
+                            .put("category", draftItemCategory)
+                            .put("effects", ItemEffectEngine.toJson(draftItemEffects)),
                             if (identifier == 0L) "Добавил предмет «$fieldName»" else "Изменил предмет «$fieldName»")
                         "ability" -> send("ability_save", JSONObject().put("id", identifier)
                             .put("name", fieldName).put("description", fieldValue)
@@ -325,7 +418,9 @@ internal fun MasterObservationDialog(
             when(identityCatalog) {
                 "race" -> fieldValue = entry.name
                 "class" -> extra = entry.name
-                "item" -> { fieldName = entry.name; extra = entry.description }
+                "item" -> { fieldName = entry.name; extra = ItemEffectEngine.templateDescription(entry.name, entry.description)
+                    draftItemCategory = entry.group
+                    draftItemEffects = ItemEffectEngine.template(entry.name) }
                 "ability" -> { fieldName = entry.name; fieldValue = entry.description }
             }
             identityCatalog = ""

@@ -8,6 +8,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -67,12 +68,12 @@ internal fun RpgPersonalNotesScreen(characterId: Long, onBack: () -> Unit) {
             addAll(RpgPersonalNotesStorage.load(context, characterId))
         }
     }
-    var filter by remember(characterId) { mutableStateOf("") }
-    var editingId by remember(characterId) { mutableStateOf<String?>(null) }
-    var heading by remember(characterId) { mutableStateOf("") }
-    var body by remember(characterId) { mutableStateOf("") }
-    var confirmDeleteId by remember(characterId) { mutableStateOf<String?>(null) }
-    var confirmDiscard by remember(characterId) { mutableStateOf(false) }
+    var filter by rememberSaveable(characterId) { mutableStateOf("") }
+    var editingId by rememberSaveable(characterId) { mutableStateOf<String?>(null) }
+    var heading by rememberSaveable(characterId) { mutableStateOf("") }
+    var body by rememberSaveable(characterId) { mutableStateOf("") }
+    var confirmDeleteId by rememberSaveable(characterId) { mutableStateOf<String?>(null) }
+    var confirmDiscard by rememberSaveable(characterId) { mutableStateOf(false) }
 
     fun store() = RpgPersonalNotesStorage.save(context, characterId, notes.toList())
     fun openNote(note: RpgPersonalNote) {
@@ -84,7 +85,10 @@ internal fun RpgPersonalNotesScreen(characterId: Long, onBack: () -> Unit) {
             existing == null && (heading.isNotBlank() || body.isNotBlank())) {
             confirmDiscard = true
         } else {
-            if (existing != null && existing.heading.isBlank() && existing.body.isBlank()) notes.removeAll { it.id == editingId }
+            if (existing != null && existing.heading.isBlank() && existing.body.isBlank()) {
+                notes.removeAll { it.id == editingId }
+                store()
+            }
             editingId = null
         }
     }
@@ -94,7 +98,9 @@ internal fun RpgPersonalNotesScreen(characterId: Long, onBack: () -> Unit) {
         title = { Text("Отменить изменения?") },
         text = { Text("Несохранённый текст будет потерян.") },
         confirmButton = {
-            TextButton(onClick = { confirmDiscard = false; if (notes.firstOrNull { it.id == editingId }?.let { it.heading.isEmpty() && it.body.isEmpty() } == true) notes.removeAll { it.id == editingId }; editingId = null }) { Text("Не сохранять") }
+            TextButton(onClick = { confirmDiscard = false; if (notes.firstOrNull { it.id == editingId }?.let { it.heading.isEmpty() && it.body.isEmpty() } == true) {
+                    notes.removeAll { it.id == editingId }; store()
+                }; editingId = null }) { Text("Не сохранять") }
         },
         dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text("Продолжить") } }
     )
@@ -135,6 +141,7 @@ internal fun RpgPersonalNotesScreen(characterId: Long, onBack: () -> Unit) {
                 Button(onClick = {
                     val note = RpgPersonalNote()
                     notes.add(0, note)
+                    store() // Preserve a just-created draft across rotation / Activity recreation.
                     editingId = note.id; heading = ""; body = ""
                 }, modifier = Modifier.padding(top = 7.dp)) { Text("+ Запись") }
             }
@@ -174,7 +181,7 @@ internal fun RpgPersonalNotesScreen(characterId: Long, onBack: () -> Unit) {
                 label = { Text("Текст заметки") },
                 placeholder = { Text("Имена, подсказки, слова NPC, важные детали...") },
                 modifier = Modifier.fillMaxWidth().weight(1f),
-                minLines = 6
+                minLines = 2
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { confirmDeleteId = editingId }) { Text("Удалить") }

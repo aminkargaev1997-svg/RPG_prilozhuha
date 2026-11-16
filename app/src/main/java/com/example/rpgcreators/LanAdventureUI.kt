@@ -38,6 +38,7 @@ internal fun AdventureObjectEditor(
     val items = remember(marker.id) { mutableStateListOf<AdventureItem>().apply { addAll(current?.items.orEmpty()) } }
     var itemName by remember(marker.id) { mutableStateOf("") }
     var itemDescription by remember(marker.id) { mutableStateOf("") }
+    var itemPresetEffects by remember(marker.id) { mutableStateOf(emptyList<ItemEffect>()) }
     var itemCategory by remember(marker.id) { mutableStateOf("Прочее") }
     var itemQuantity by remember(marker.id) { mutableStateOf("1") }
     var itemPrice by remember(marker.id) { mutableStateOf("10") }
@@ -177,8 +178,9 @@ internal fun AdventureObjectEditor(
                             items.add(AdventureItem(name = itemName.trim(), description = itemDescription.trim(),
                                 category = itemCategory.ifBlank { "Прочее" }, quantity = itemQuantity.ifBlank { "1" },
                                 keyFor = if (isShop) "" else itemKeyFor,
-                                price = if (isShop) price else 0, stock = if (isShop) stock else 1))
-                            itemName = ""; itemDescription = ""; itemKeyFor = ""; itemQuantity = "1"
+                                price = if (isShop) price else 0, stock = if (isShop) stock else 1,
+                                effects = itemPresetEffects))
+                            itemName = ""; itemDescription = ""; itemKeyFor = ""; itemQuantity = "1"; itemPresetEffects = emptyList()
                         }, enabled = itemName.isNotBlank() && items.size < 100 &&
                             (!isShop || (price in 1..1_000_000 && stock in 1..999)),
                             modifier = Modifier.fillMaxWidth()) {
@@ -205,8 +207,9 @@ internal fun AdventureObjectEditor(
         title = if (isShop) "Товар из базы" else "Предмет из базы",
         entries = RpgEquipmentAbilitiesCatalog.items,
         onSelect = { picked ->
-            itemName = picked.name; itemDescription = picked.description
-            itemCategory = picked.group.ifBlank { "Прочее" }
+            itemName = picked.name; itemDescription = ItemEffectEngine.templateDescription(picked.name, picked.description)
+            itemPresetEffects = ItemEffectEngine.template(picked.name)
+            itemCategory = picked.group
             showItemCatalog = false
         },
         onDismiss = { showItemCatalog = false }
@@ -442,7 +445,7 @@ internal fun AdventureShopDialog(
                                         Row(Modifier.fillMaxWidth().padding(9.dp), verticalAlignment = Alignment.CenterVertically) {
                                             Column(Modifier.weight(1f)) {
                                                 Text(item.name, fontWeight = FontWeight.SemiBold, maxLines = 2)
-                                                Text("${item.price} монет · ${item.stock} шт. в наличии",
+                                                Text("${item.price} зол. · ${item.stock} шт. в наличии",
                                                     style = MaterialTheme.typography.bodySmall)
                                             }
                                             IconButton(onClick = {
@@ -465,15 +468,15 @@ internal fun AdventureShopDialog(
                                 verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 if (chosen.isEmpty()) Text("Пока ничего не выбрано", style = MaterialTheme.typography.bodySmall)
                                 chosen.forEach { (item, count) ->
-                                    Text("${item.name} ×$count — ${item.price.toLong() * count} монет",
+                                    Text("${item.name} ×$count — ${item.price.toLong() * count} зол.",
                                         style = MaterialTheme.typography.bodySmall)
                                 }
                             }
                             HorizontalDivider()
-                            Text("На счету: $balance монет")
-                            Text("Сумма: $total монет", fontWeight = FontWeight.Bold)
-                            Text(if (total <= balance) "Останется: ${balance - total} монет"
-                                else "Не хватает: ${total - balance} монет",
+                            Text("На счету: $balance зол.")
+                            Text("Сумма: $total зол.", fontWeight = FontWeight.Bold)
+                            Text(if (total <= balance) "Останется: ${balance - total} зол."
+                                else "Не хватает: ${total - balance} зол.",
                                 color = if (total > balance) MaterialTheme.colorScheme.error
                                 else MaterialTheme.colorScheme.onSurface)
                             if (waitingDelivery) Text("Предыдущая покупка доставляется…",

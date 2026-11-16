@@ -53,6 +53,7 @@ fun RpgCatalogPickerDialog(
     onDismiss: () -> Unit
 ) {
     val markerCatalog = entries === RpgCatalog.markerPresets
+    val equipmentCatalog = entries === RpgEquipmentAbilitiesCatalog.items
     var query by remember(title) { mutableStateOf("") }
     var group by remember(title) { mutableStateOf("Все") }
     var genre by remember(title) { mutableStateOf("Все жанры") }
@@ -176,6 +177,7 @@ fun RpgCatalogPickerDialog(
                                 modifier = Modifier.weight(1f).fillMaxHeight(),
                                 entries = found,
                                 markerCatalog = markerCatalog,
+                                equipmentCatalog = equipmentCatalog,
                                 showGenre = genres.size > 2,
                                 stateKey = "$group/$genre/$query",
                                 onSelect = onSelect
@@ -210,6 +212,7 @@ fun RpgCatalogPickerDialog(
                                 modifier = Modifier.fillMaxWidth().weight(1f),
                                 entries = found,
                                 markerCatalog = markerCatalog,
+                                equipmentCatalog = equipmentCatalog,
                                 showGenre = genres.size > 2,
                                 stateKey = "$group/$genre/$query",
                                 onSelect = onSelect
@@ -256,6 +259,7 @@ private fun CatalogResultList(
     modifier: Modifier,
     entries: List<CatalogEntry>,
     markerCatalog: Boolean,
+    equipmentCatalog: Boolean,
     showGenre: Boolean,
     stateKey: String,
     onSelect: (CatalogEntry) -> Unit
@@ -309,6 +313,17 @@ private fun CatalogResultList(
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis
                             )
+                            if (equipmentCatalog) {
+                                Text(entry.group, style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                val readyEffects = ItemEffectEngine.template(entry.name)
+                                if (readyEffects.isNotEmpty()) Text(
+                                    "✦ " + readyEffects.joinToString(" · ") { it.readable() },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    maxLines = 2, overflow = TextOverflow.Ellipsis
+                                )
+                            }
                             if (showGenre) {
                                 Text(
                                     entry.genre,

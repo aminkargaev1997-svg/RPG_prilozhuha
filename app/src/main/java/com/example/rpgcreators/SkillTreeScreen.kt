@@ -12,6 +12,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
@@ -76,14 +77,14 @@ fun SkillTreeScreen(
     onUpdated: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
-    val nodes = remember(character.race, character.profession) { SkillTreeEngine.nodes(character) }
+    val nodes = remember(character.race, character.profession, character.buildVersion) { SkillTreeEngine.nodes(character) }
     var state by remember(character.id) { mutableStateOf(SkillTreeStorage.load(context, character.id)) }
     var selected by remember { mutableStateOf<TalentNode?>(null) }
     var confirmReset by remember { mutableStateOf(false) }
     var size by remember { mutableStateOf(IntSize.Zero) }
     var scale by remember { mutableFloatStateOf(0.58f) }
     var pan by remember { mutableStateOf(Offset.Zero) }
-    val available = SkillTreeEngine.totalPoints(character, state) - SkillTreeEngine.spent(nodes, state)
+    val available = SkillTreeEngine.remainingPoints(character, state, nodes)
     val accent = Color(0xFFF2C777)
     val center = Offset(size.width / 2f, size.height / 2f) + pan
     // Tap recognition should not restart on every drag/zoom frame.
@@ -102,12 +103,16 @@ fun SkillTreeScreen(
                 Column(Modifier.weight(1f)) {
                     Text("Древо навыков", color = accent, fontWeight = FontWeight.Bold)
                     Text("${character.race} · ${character.profession} · Ур. ${character.level}/20", color = Color.LightGray, style = MaterialTheme.typography.labelSmall)
+                    if (character.buildVersion >= 2) {
+                        Text("Очки: ${SkillTreeEngine.totalPoints(character, state)} / ${SkillTreeEngine.maxPoints(character)} · +1 за уровень",
+                            color = Color.LightGray, style = MaterialTheme.typography.labelSmall)
+                    }
                 }
                 Text("Очков: $available", color = accent)
                 TextButton(onClick = { scale = 0.58f; pan = limitTreePan(Offset.Zero, 0.58f, size, nodes) }) { Text("Центр", color = accent) }
                 if (asMaster) TextButton(onClick = { confirmReset = true }) { Text("Сброс", color = accent) }
             }
-            Box(Modifier.weight(1f).fillMaxWidth()) {
+            Box(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
                 Canvas(Modifier.fillMaxSize().onSizeChanged { size = it }
                     .pointerInput(character.id, nodes) {
                         detectTapGestures { tap ->

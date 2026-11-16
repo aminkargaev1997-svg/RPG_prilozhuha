@@ -24,6 +24,45 @@ internal object LanRoomStorage {
         }
     }
 
+    /** The guest keeps a stable identity per character on this installation. */
+    fun guestIdentity(context: Context, characterId: Long): String = synchronized(guard) {
+        val prefs = context.getSharedPreferences("rpg_lan_cache", Context.MODE_PRIVATE)
+        val key = "guest_identity_${characterId}"
+        prefs.getString(key, null) ?: UUID.randomUUID().toString().also {
+            prefs.edit().putString(key, it).commit()
+        }
+    }
+
+    /** Persist map positions across host restarts and guest reconnections. */
+    fun savePlayerPosition(context: Context, roomId: String, identity: String, mapId: String,
+                           x: Float, y: Float) {
+        synchronized(guard) {
+            if (roomId.isBlank() || identity.isBlank() || mapId.isBlank()) return@synchronized
+            val prefs = context.getSharedPreferences("rpg_lan_cache", Context.MODE_PRIVATE)
+            val key = "guest_position_${cachedMapId(roomId, identity)}"
+            val all = JSONObject(prefs.getString(key, "{}") ?: "{}")
+            all.put(mapId, JSONArray().put(x.coerceIn(0f, 1f).toDouble()).put(y.coerceIn(0f, 1f).toDouble()))
+            prefs.edit().putString(key, all.toString()).putString("${key}_lastmap", mapId).apply()
+        }
+    }
+
+    fun loadPlayerPosition(context: Context, roomId: String, identity: String, mapId: String): Pair<Float, Float>? {
+        if (roomId.isBlank() || identity.isBlank() || mapId.isBlank()) return null
+        return try {
+            val key = "guest_position_${cachedMapId(roomId, identity)}"
+            val value = JSONObject(context.getSharedPreferences("rpg_lan_cache", Context.MODE_PRIVATE)
+                .getString(key, "{}") ?: "{}").optJSONArray(mapId) ?: return null
+            value.getDouble(0).toFloat().coerceIn(0f, 1f) to value.getDouble(1).toFloat().coerceIn(0f, 1f)
+        } catch (_: Exception) { null }
+    }
+
+    fun loadLastPlayerMap(context: Context, roomId: String, identity: String): String {
+        if (roomId.isBlank() || identity.isBlank()) return ""
+        val key = "guest_position_${cachedMapId(roomId, identity)}"
+        return context.getSharedPreferences("rpg_lan_cache", Context.MODE_PRIVATE)
+            .getString("${key}_lastmap", "").orEmpty()
+    }
+
     /** Null means never stored; an empty list means the player deleted every marker. */
     fun loadRoomMarkers(context: Context, roomId: String, mapId: String): List<LanMarker>? {
         val key = "markers_${cachedMapId(roomId, mapId)}"
@@ -36,7 +75,15 @@ internal object LanRoomStorage {
                 LanMarker(item.getString("id"), item.getString("name"),
                     item.optString("description"), item.optString("type", "Обычная"),
                     item.getDouble("x").toFloat(), item.getDouble("y").toFloat(),
-                    item.optString("ownerId", "host"))
+                    item.optString("ownerId", "host"),
+                    item.optInt("hp", if (item.optString("type") in setOf("Враг", "Босс", "NPC", "Союзник", "Игрок", "Торговец")) 10 else -1),
+                    item.optInt("maxHp", if (item.optString("type") in setOf("Враг", "Босс", "NPC", "Союзник", "Игрок", "Торговец")) 10 else -1),
+                    item.optBoolean("hidden", false), item.optString("revealMode", "zone"),
+                    item.optString("revealShape", "circle"),
+                    item.optDouble("revealRadiusX", 0.035).toFloat(),
+                    item.optDouble("revealRadiusY", 0.035).toFloat(),
+                    item.optString("revealTo", "all"), item.optBoolean("revealedAll", false),
+                    item.optJSONArray("revealedFor")?.let { a -> (0 until a.length()).map { a.optString(it) }.toSet() } ?: emptySet())
             }
         } catch (_: Exception) { null }
     }
@@ -48,7 +95,12 @@ internal object LanRoomStorage {
             array.put(JSONObject().put("id", marker.id).put("name", marker.name)
                 .put("description", marker.description).put("type", marker.type)
                 .put("x", marker.x.toDouble()).put("y", marker.y.toDouble())
-                .put("ownerId", marker.ownerId))
+                .put("ownerId", marker.ownerId).put("hp", marker.hp).put("maxHp", marker.maxHp)
+                .put("hidden", marker.hidden).put("revealMode", marker.revealMode)
+                .put("revealShape", marker.revealShape)
+                .put("revealRadiusX", marker.revealRadiusX.toDouble()).put("revealRadiusY", marker.revealRadiusY.toDouble())
+                .put("revealTo", marker.revealTo).put("revealedAll", marker.revealedAll)
+                .put("revealedFor", JSONArray(marker.revealedFor.toList())))
         }
         context.getSharedPreferences("rpg_lan_cache", Context.MODE_PRIVATE).edit()
             .putString("markers_${cachedMapId(roomId, mapId)}", array.toString()).apply()
